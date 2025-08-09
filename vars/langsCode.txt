@@ -1,0 +1,1 @@
+en, ru, es, pt, de, fr, it, zh, ja, ko, ar, tr, fa, id, vi, th, ms, hi, bn, uk, pl, nl, sv, fi, da, no, ro, hu, cs, el, ca, sr, bg, hr, sl, sk, et, lv, lt, mk, af, ru, ka, az, uz, kk, ru
