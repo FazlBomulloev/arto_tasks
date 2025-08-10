@@ -3,6 +3,7 @@ import logging
 import time
 import random
 import math
+import json
 from typing import List, Dict, Optional
 from dataclasses import dataclass
 from enum import Enum
@@ -219,7 +220,7 @@ class TaskService:
                 
                 # Добавляем в очередь Redis
                 queue_key = f"delayed_view_batches"
-                redis_client.lpush(queue_key, str(batch_data))
+                redis_client.lpush(queue_key, json.dumps(batch_data))
                 
                 # Устанавливаем TTL на 12 часов (с запасом)
                 redis_client.expire(queue_key, 12 * 3600)
@@ -232,7 +233,7 @@ class TaskService:
     
     async def create_subscription_tasks(self, channel_name: str, target_lang: str) -> Dict[str, int]:
         """
-        Создает задачи подписки с умными задержками (как раньше)
+        Создает задачи подписки с ПРАВИЛЬНЫМИ умными задержками
         
         Returns:
             Dict с результатами создания задач
@@ -253,17 +254,33 @@ class TaskService:
             
             results['accounts_processed'] = len(accounts)
             
-            # Получаем параметры задержек
+            # Получаем параметры задержек из настроек
             params = await self._get_subscription_delays()
+            
+            logger.info(f"""
+📊 Параметры подписок для канала @{channel_name}:
+   📱 Аккаунтов: {len(accounts)}
+   ⏰ Базовая задержка: {params['base_delay']/60:.1f} мин
+   🎲 Разброс: ±{params['range_val']/60:.1f} мин
+   👥 Между аккаунтами: {params['accounts_delay']/60:.1f} мин
+   🔢 Подписок до паузы: {params['timeout_count']}
+   ⏸️ Пауза: {params['timeout_duration']/60:.1f} мин
+            """)
+            
+            # Перемешиваем аккаунты для равномерности
+            random.shuffle(accounts)
             
             # Создаем задачи с рассчитанными задержками
             subscription_tasks = []
+            current_time = time.time()
             
             for account_idx, account in enumerate(accounts):
-                # Рассчитываем задержку для этого аккаунта
-                delay = await self._calculate_subscription_delay(
-                    account_idx, 0, params  # subscription_index = 0 для нового канала
+                # Рассчитываем ТОЧНУЮ задержку для этого аккаунта
+                delay_seconds = await self._calculate_precise_subscription_delay(
+                    account_idx, params
                 )
+                
+                execute_at = current_time + delay_seconds
                 
                 task = TaskItem(
                     account_session=account['session_data'],
@@ -271,21 +288,29 @@ class TaskService:
                     channel=channel_name,
                     lang=english_lang,
                     task_type=TaskType.SUBSCRIBE,
-                    execute_at=time.time() + delay
+                    execute_at=execute_at
                 )
                 
                 subscription_tasks.append(task)
+                
+                # Логируем каждые 50 аккаунтов
+                if (account_idx + 1) % 50 == 0 or account_idx == len(accounts) - 1:
+                    delay_minutes = delay_seconds / 60
+                    logger.info(f"📅 Аккаунт {account_idx + 1}/{len(accounts)}: @{account['phone_number']} через {delay_minutes:.1f} мин")
             
             results['total_tasks'] = len(subscription_tasks)
             
-            # Отправляем задачи в очередь
-            await self._schedule_subscription_tasks(subscription_tasks)
+            # Отправляем задачи в очередь с временными метками
+            await self._schedule_subscription_tasks_with_delays(subscription_tasks)
+            
+            # Статистика по времени
+            total_duration_hours = max(task.execute_at - current_time for task in subscription_tasks) / 3600
             
             logger.info(f"""
-📊 Создано задач подписки на канал @{channel_name}:
-   📱 Аккаунтов: {results['accounts_processed']}
-   📋 Задач: {results['total_tasks']}
-   🌐 Язык: {target_lang}
+✅ Создано {results['total_tasks']} задач подписки:
+   📅 Длительность: {total_duration_hours:.1f} часов
+   ⚡ Первая подписка: через {min(task.execute_at - current_time for task in subscription_tasks)/60:.1f} мин
+   🏁 Последняя подписка: через {total_duration_hours:.1f} часов
             """)
             
             return results
@@ -304,39 +329,44 @@ class TaskService:
             'timeout_duration': read_setting('timeout_duration.txt', 20.0) * 60
         }
     
-    async def _calculate_subscription_delay(self, account_index: int, 
-                                          subscription_index: int, 
-                                          params: Dict[str, float]) -> float:
-        """Рассчитывает задержку для подписки (логика как в оригинале)"""
+    async def _calculate_precise_subscription_delay(self, account_index: int, params: Dict[str, float]) -> float:
+        """
+        Рассчитывает ТОЧНУЮ задержку для подписки с учетом всех параметров
+        """
+        base_delay = params['base_delay']           # Основная задержка (секунды)
+        range_val = params['range_val']             # Разброс (секунды)
+        accounts_delay = params['accounts_delay']   # Между аккаунтами (секунды)
+        timeout_count = params['timeout_count']     # Подписок до паузы
+        timeout_duration = params['timeout_duration'] # Длительность паузы (секунды)
         
-        # Базовые параметры
-        base_delay = params['base_delay']
-        range_val = params['range_val'] 
-        accounts_delay = params['accounts_delay']
-        timeout_count = params['timeout_count']
-        timeout_duration = params['timeout_duration']
+        # 1. Базовая задержка между аккаунтами
+        account_delay = account_index * accounts_delay
         
-        # 1. Задержка между аккаунтами
-        account_delay = account_index * accounts_delay * random.uniform(0.9, 1.1)
+        # 2. Добавляем случайный разброс к каждому аккаунту
+        random_variation = random.uniform(-range_val, range_val)
         
-        # 2. Задержка между подписками  
-        subscription_delay = subscription_index * base_delay * random.uniform(0.9, 1.1)
+        # 3. Добавляем паузы после каждых timeout_count подписок
+        timeout_cycles = account_index // timeout_count
+        timeout_delay = timeout_cycles * timeout_duration
         
-        # 3. Таймауты после определенного количества подписок
-        full_timeouts = subscription_index // timeout_count
-        timeout_delay = full_timeouts * timeout_duration * random.uniform(0.9, 1.1)
+        # 4. Итоговая задержка
+        total_delay = account_delay + random_variation + timeout_delay
         
-        # Общая задержка
-        total_delay = account_delay + subscription_delay + timeout_delay
+        # 5. Минимальная задержка - не менее базовой
+        total_delay = max(total_delay, base_delay)
         
-        # 4. Добавляем случайную вариацию
-        variation = random.uniform(-range_val, range_val)
-        total_delay = max(0, total_delay + variation)
+        logger.debug(f"""
+🔢 Расчет задержки для аккаунта #{account_index}:
+   👥 Между аккаунтами: {account_delay/60:.1f} мин
+   🎲 Случайный разброс: {random_variation/60:.1f} мин  
+   ⏸️ Паузы (циклов: {timeout_cycles}): {timeout_delay/60:.1f} мин
+   📊 ИТОГО: {total_delay/60:.1f} мин
+        """)
         
         return total_delay
     
-    async def _schedule_subscription_tasks(self, tasks: List[TaskItem]):
-        """Планирует задачи подписки"""
+    async def _schedule_subscription_tasks_with_delays(self, tasks: List[TaskItem]):
+        """Планирует задачи подписки с учетом времени выполнения"""
         try:
             from redis import Redis
             from config import REDIS_HOST, REDIS_PORT, REDIS_PASSWORD
@@ -348,6 +378,9 @@ class TaskService:
                 decode_responses=True
             )
             
+            # Сортируем задачи по времени выполнения
+            tasks.sort(key=lambda x: x.execute_at)
+            
             for task in tasks:
                 task_data = {
                     'account_session': task.account_session,
@@ -355,17 +388,18 @@ class TaskService:
                     'channel': task.channel,
                     'lang': task.lang,
                     'task_type': task.task_type.value,
-                    'execute_at': task.execute_at,
-                    'retry_count': task.retry_count
+                    'execute_at': task.execute_at,  # ВАЖНО: сохраняем время выполнения
+                    'retry_count': task.retry_count,
+                    'created_at': time.time()
                 }
                 
                 # Добавляем в очередь подписок
-                redis_client.lpush("subscription_tasks", str(task_data))
-                
-                # TTL на 24 часа
-                redis_client.expire("subscription_tasks", 24 * 3600)
+                redis_client.lpush("subscription_tasks", json.dumps(task_data))
             
-            logger.info(f"📋 Запланировано {len(tasks)} задач подписки")
+            # TTL на 48 часов (с запасом)
+            redis_client.expire("subscription_tasks", 48 * 3600)
+            
+            logger.info(f"📋 Запланировано {len(tasks)} задач подписки с временными метками")
             
         except Exception as e:
             logger.error(f"Ошибка планирования задач подписки: {e}")

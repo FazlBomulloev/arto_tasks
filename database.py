@@ -98,7 +98,7 @@ async def create_tables():
                     )
                 """)
 
-                # Таблица аккаунтов (обновленная)
+                # Таблица аккаунтов (обновленная с полем fail)
                 await conn.execute(f"""
                     CREATE TABLE IF NOT EXISTS {TAB_ACC}(
                         id SERIAL PRIMARY KEY,
@@ -125,12 +125,21 @@ async def create_tables():
                     )
                 """)
 
+                # Добавляем поле fail если его нет (для совместимости)
+                try:
+                    await conn.execute(f"ALTER TABLE {TAB_ACC} ADD COLUMN IF NOT EXISTS fail INTEGER DEFAULT 0")
+                except:
+                    pass  # Поле уже существует
+
                 # Индексы для оптимизации
                 await conn.execute(f"CREATE INDEX IF NOT EXISTS idx_acc_lang ON {TAB_ACC}(lang)")
                 await conn.execute(f"CREATE INDEX IF NOT EXISTS idx_acc_status ON {TAB_ACC}(status)")
                 await conn.execute(f"CREATE INDEX IF NOT EXISTS idx_acc_phone ON {TAB_ACC}(phone_number)")
                 await conn.execute(f"CREATE INDEX IF NOT EXISTS idx_chan_lang ON {TAB_CHAN}(lang)")
                 await conn.execute(f"CREATE INDEX IF NOT EXISTS idx_stat_date ON {TAB_STAT}(date)")
+                
+                # Специальный индекс для забаненных аккаунтов
+                await conn.execute(f"CREATE INDEX IF NOT EXISTS idx_acc_ban_retry ON {TAB_ACC}(status, last_used) WHERE status = 'ban'")
 
                 # Триггер для обновления updated_at
                 await conn.execute(f"""
@@ -230,6 +239,61 @@ async def update_account_status(phone: str, status: str) -> bool:
         except Exception as e:
             logger.error(f"Failed to update account {phone} status: {e}")
             return False
+
+async def increment_account_fails(phone: str) -> int:
+    """Увеличивает счетчик неудач и возвращает новое значение"""
+    async with db_session() as conn:
+        try:
+            result = await conn.fetchrow(
+                f"UPDATE {TAB_ACC} SET fail = fail + 1, last_used = CURRENT_TIMESTAMP WHERE phone_number = $1 RETURNING fail",
+                phone
+            )
+            return result['fail'] if result else 0
+        except Exception as e:
+            logger.error(f"Failed to increment fails for {phone}: {e}")
+            return 0
+
+async def reset_account_fails(phone: str) -> bool:
+    """Сбрасывает счетчик неудач и возвращает в active"""
+    async with db_session() as conn:
+        try:
+            await conn.execute(
+                f"UPDATE {TAB_ACC} SET fail = 0, status = 'active', last_used = CURRENT_TIMESTAMP WHERE phone_number = $1",
+                phone
+            )
+            return True
+        except Exception as e:
+            logger.error(f"Failed to reset fails for {phone}: {e}")
+            return False
+
+async def get_ban_accounts_for_retry() -> List[Dict]:
+    """Получает забаненные аккаунты, готовые для повторной проверки (раз в 120 часов)"""
+    async with db_session() as conn:
+        try:
+            # Аккаунты со статусом 'ban', которые не проверялись 120 часов
+            query = f"""
+                SELECT * FROM {TAB_ACC} 
+                WHERE status = 'ban' 
+                AND (last_used IS NULL OR last_used < NOW() - INTERVAL '120 hours')
+                ORDER BY last_used ASC NULLS FIRST
+                LIMIT 100
+            """
+            rows = await conn.fetch(query)
+            return [dict(row) for row in rows]
+        except Exception as e:
+            logger.error(f"Failed to get ban accounts for retry: {e}")
+            return []
+
+async def mark_account_retry_attempt(phone: str):
+    """Отмечает попытку проверки забаненного аккаунта"""
+    async with db_session() as conn:
+        try:
+            await conn.execute(
+                f"UPDATE {TAB_ACC} SET last_used = CURRENT_TIMESTAMP WHERE phone_number = $1",
+                phone
+            )
+        except Exception as e:
+            logger.error(f"Failed to mark retry attempt for {phone}: {e}")
 
 async def delete_accounts_by_status(status: str, limit: int = None) -> int:
     """Удаляет аккаунты по статусу"""

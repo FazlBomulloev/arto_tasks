@@ -9,8 +9,12 @@ from telethon.errors import FloodWaitError, RPCError, AuthKeyInvalidError
 from telethon.tl.functions.messages import GetMessagesViewsRequest
 from telethon.tl.functions.channels import JoinChannelRequest
 
-from config import find_lang_code, API_ID, API_HASH
-from database import init_db_pool, shutdown_db_pool, update_account_status
+from config import find_lang_code, API_ID, API_HASH, read_setting
+from database import (
+    init_db_pool, shutdown_db_pool, update_account_status,
+    increment_account_fails, reset_account_fails, 
+    get_ban_accounts_for_retry, mark_account_retry_attempt
+)
 from session_manager import global_session_manager
 from exceptions import SessionError, RateLimitError
 from redis import Redis
@@ -35,6 +39,7 @@ class TaskWorker:
         self.running = False
         self.max_retries = 3
         self.sessions_loaded = False
+        self.ban_retry_hours = 120  # 120 часов между попытками для забаненных
         
     async def start(self):
         """Запуск воркера"""
@@ -81,13 +86,16 @@ class TaskWorker:
                 logger.info(f"✅ Предзагрузка завершена: {results['loaded']} сессий готово к работе")
                 self.sessions_loaded = True
                 
+            # ВАЖНО: Обновляем статус из session_manager
+            self.sessions_loaded = global_session_manager.loading_complete
+                
         except Exception as e:
             logger.error(f"❌ Ошибка при загрузке сессий: {e}")
             logger.info("💡 Воркер продолжит работу в режиме ожидания аккаунтов...")
             self.sessions_loaded = False
     
     async def _main_loop(self):
-        """Основной цикл обработки задач"""
+        """Основной цикл обработки задач с УМНОЙ проверкой сессий"""
         logger.info("🔄 Запуск основного цикла обработки задач")
         
         # Счетчики для статистики
@@ -95,17 +103,38 @@ class TaskWorker:
         processed_subs = 0
         last_stats_time = time.time()
         last_session_check = time.time()
+        last_ban_check = time.time()
+        last_health_check = time.time()
         
         while self.running:
             try:
-                # Если сессии не загружены, пытаемся загрузить каждые 5 минут
-                if not self.sessions_loaded and time.time() - last_session_check > 300:
+                # УМНАЯ проверка сессий - только если действительно нужно
+                current_time = time.time()
+                
+                # 1. Если сессии НЕ загружены, проверяем каждые 5 минут
+                if not self.sessions_loaded and current_time - last_session_check > 300:
                     logger.info("🔍 Проверяю появление новых аккаунтов...")
                     await self._try_preload_sessions()
-                    last_session_check = time.time()
+                    last_session_check = current_time
                 
-                # Если сессии загружены, обрабатываем задачи
-                if self.sessions_loaded:
+                # 2. Если сессии загружены, но session_manager говорит что нет - синхронизируем
+                elif self.sessions_loaded and not global_session_manager.loading_complete:
+                    logger.warning("⚠️ Рассинхронизация статуса сессий, исправляю...")
+                    self.sessions_loaded = global_session_manager.loading_complete
+                    
+                # 3. Если долго нет новых аккаунтов, проверяем раз в час
+                elif self.sessions_loaded and len(global_session_manager.clients) == 0 and current_time - last_session_check > 3600:
+                    logger.info("🔍 Периодическая проверка новых аккаунтов (раз в час)...")
+                    await self._try_preload_sessions()
+                    last_session_check = current_time
+                
+                # Проверка забаненных аккаунтов (раз в час)
+                if current_time - last_ban_check > 3600:
+                    await self._check_banned_accounts_for_retry()
+                    last_ban_check = current_time
+                
+                # Основная работа - только если сессии загружены
+                if self.sessions_loaded and len(global_session_manager.clients) > 0:
                     # Обрабатываем отложенные просмотры
                     view_tasks = await self._get_ready_view_tasks()
                     if view_tasks:
@@ -121,15 +150,16 @@ class TaskWorker:
                     # Обрабатываем retry задачи
                     await self._process_retry_tasks()
                     
-                    # Health check сессий каждые 15 минут
-                    if random.random() < 0.01:  # ~1% шанс = примерно раз в 15 минут
+                    # Health check сессий каждые 30 минут (было 15)
+                    if current_time - last_health_check > 1800:
                         health_stats = await global_session_manager.health_check()
                         if health_stats.get('removed_dead', 0) > 0:
                             logger.info(f"🔧 Очищено {health_stats['removed_dead']} мертвых сессий")
+                        last_health_check = current_time
                 
                 # Статистика каждые 5 минут
-                if time.time() - last_stats_time > 300:
-                    if self.sessions_loaded:
+                if current_time - last_stats_time > 300:
+                    if self.sessions_loaded and len(global_session_manager.clients) > 0:
                         session_stats = await global_session_manager.get_stats()
                         logger.info(f"""
 📊 Статистика за 5 минут:
@@ -137,14 +167,20 @@ class TaskWorker:
    📺 Подписок: {processed_subs}
    🧠 Сессий активно: {session_stats['connected']}/{session_stats['total_loaded']}
                         """)
+                    elif self.sessions_loaded:
+                        logger.info("⏳ Сессии загружены, но аккаунтов нет в пуле")
                     else:
                         logger.info("⏳ Воркер активен, ожидаю загрузки аккаунтов...")
                     
                     processed_views = processed_subs = 0
-                    last_stats_time = time.time()
+                    last_stats_time = current_time
                 
-                # Пауза между циклами (больше если нет сессий)
-                sleep_time = 5 if self.sessions_loaded else 30
+                # Пауза между циклами
+                if self.sessions_loaded and len(global_session_manager.clients) > 0:
+                    sleep_time = 5  # Активная работа - короткие паузы
+                else:
+                    sleep_time = 30  # Ожидание - длинные паузы
+                    
                 await asyncio.sleep(sleep_time)
                 
             except KeyboardInterrupt:
@@ -154,6 +190,48 @@ class TaskWorker:
             except Exception as e:
                 logger.error(f"❌ Ошибка в основном цикле: {e}")
                 await asyncio.sleep(10)  # Пауза при ошибке
+    
+    async def _check_banned_accounts_for_retry(self):
+        """Проверяет забаненные аккаунты раз в 120 часов"""
+        try:
+            ban_accounts = await get_ban_accounts_for_retry()
+            
+            if not ban_accounts:
+                return
+            
+            logger.info(f"🔍 Проверяю {len(ban_accounts)} забаненных аккаунтов...")
+            
+            for account in ban_accounts:
+                phone = account['phone_number']
+                
+                try:
+                    # Отмечаем попытку проверки
+                    await mark_account_retry_attempt(phone)
+                    
+                    # Создаем простую тестовую задачу
+                    test_task = {
+                        'account_session': account['session_data'],
+                        'phone': phone,
+                        'channel': 'telegram',  # Простой канал для теста
+                        'lang': account['lang']
+                    }
+                    
+                    # Пытаемся выполнить тестовую подписку
+                    success = await self._execute_subscription_task(test_task)
+                    
+                    if success:
+                        logger.info(f"🔓 {phone}: восстановлен из бана!")
+                    else:
+                        logger.info(f"🚫 {phone}: остается в бане")
+                        
+                    # Задержка между проверками
+                    await asyncio.sleep(random.uniform(30, 60))
+                    
+                except Exception as e:
+                    logger.error(f"Ошибка проверки забаненного аккаунта {phone}: {e}")
+                    
+        except Exception as e:
+            logger.error(f"Ошибка проверки забаненных аккаунтов: {e}")
     
     async def _get_ready_view_tasks(self) -> List[Dict]:
         """Получает готовые к выполнению задачи просмотра"""
@@ -171,7 +249,7 @@ class TaskWorker:
                     break
                 
                 try:
-                    batch = eval(batch_data)  # Простой parsing, в продакшене лучше json
+                    batch = json.loads(batch_data)
                     
                     # Проверяем время выполнения
                     if batch['execute_at'] <= current_time:
@@ -194,36 +272,54 @@ class TaskWorker:
             return []
     
     async def _get_ready_subscription_tasks(self) -> List[Dict]:
-        """Получает готовые к выполнению задачи подписки"""
+        """Получает готовые к выполнению задачи подписки С ПРОВЕРКОЙ ВРЕМЕНИ"""
         if not self.sessions_loaded:
             return []
             
         try:
             current_time = time.time()
             ready_tasks = []
+            checked_tasks = 0
+            max_checks = 200  # Максимум задач для проверки за раз
             
-            # Получаем задачи из очереди
-            for _ in range(100):  # Максимум 100 задач за раз
+            # Получаем задачи из очереди и проверяем время
+            temp_storage = []  # Временное хранение "не готовых" задач
+            
+            while checked_tasks < max_checks:
                 task_data = self.redis_client.rpop('subscription_tasks')
                 if not task_data:
                     break
                 
+                checked_tasks += 1
+                
                 try:
-                    task = eval(task_data)  # Простой parsing
+                    task = json.loads(task_data)
                     
                     # Проверяем время выполнения
-                    if task['execute_at'] <= current_time:
+                    execute_at = task.get('execute_at', 0)
+                    
+                    if execute_at <= current_time:
+                        # Время пришло - добавляем к готовым
                         ready_tasks.append(task)
+                        phone = task.get('phone', 'unknown')
+                        delay_was = (current_time - task.get('created_at', current_time)) / 60
+                        logger.info(f"⏰ Подписка готова: @{phone} (ждала {delay_was:.1f} мин)")
                     else:
-                        # Время еще не пришло - возвращаем в очередь
-                        self.redis_client.lpush('subscription_tasks', task_data)
-                        break
+                        # Время еще не пришло - сохраняем для возврата
+                        temp_storage.append(task_data)
                         
                 except Exception as e:
                     logger.error(f"Ошибка парсинга задачи подписки: {e}")
                     continue
             
-            return ready_tasks
+            # Возвращаем "не готовые" задачи обратно в очередь
+            for task_data in temp_storage:
+                self.redis_client.lpush('subscription_tasks', task_data)
+            
+            if ready_tasks:
+                logger.info(f"📺 Готово {len(ready_tasks)} подписок из {checked_tasks} проверенных")
+            
+            return ready_tasks[:50]  # Максимум 50 подписок за раз
             
         except Exception as e:
             logger.error(f"Ошибка получения задач подписки: {e}")
@@ -271,12 +367,11 @@ class TaskWorker:
             logger.info(f"✅ Просмотры в батче: {success_count}/{task_count} успешно")
     
     async def _execute_view_task(self, task: Dict) -> bool:
-        """Выполняет одну задачу просмотра"""
+        """Выполняет одну задачу просмотра с обработкой банов"""
         session_data = task['account_session']
         phone = task['phone']
         channel = task['channel']
         post_id = task['post_id']
-        lang = task['lang']
         
         try:
             # Получаем готовый клиент из пула
@@ -284,6 +379,7 @@ class TaskWorker:
             
             if not client:
                 logger.warning(f"❌ {phone}: клиент недоступен")
+                await self._handle_task_failure(phone, 'view')
                 return False
             
             # Добавляем небольшую случайную задержку внутри батча
@@ -294,6 +390,7 @@ class TaskWorker:
                 channel_entity = await client.get_entity(channel)
             except Exception as e:
                 logger.warning(f"❌ {phone}: не удалось получить канал @{channel}: {e}")
+                await self._handle_task_failure(phone, 'view')
                 return False
             
             # Выполняем просмотр
@@ -306,6 +403,8 @@ class TaskWorker:
             # Имитируем время чтения
             await asyncio.sleep(random.uniform(1, 3))
             
+            # УСПЕХ - сбрасываем счетчик неудач
+            await self._handle_task_success(phone)
             logger.debug(f"✅ {phone}: просмотр поста {post_id} в @{channel}")
             return True
             
@@ -315,26 +414,23 @@ class TaskWorker:
             await self._add_to_retry_queue(task, 'view', delay=e.seconds)
             return False
             
-        except RPCError as e:
-            if "FROZEN" in str(e):
-                logger.warning(f"🥶 {phone}: аккаунт заморожен")
-                await update_account_status(phone, 'pause')
-            else:
-                logger.error(f"❌ {phone}: RPC ошибка - {e}")
+        except (RPCError, AuthKeyInvalidError) as e:
+            logger.warning(f"❌ {phone}: критическая ошибка - {e}")
+            await self._handle_task_failure(phone, 'view')
             return False
             
         except Exception as e:
             logger.error(f"💥 {phone}: неожиданная ошибка - {e}")
+            await self._handle_task_failure(phone, 'view')
             return False
     
     async def _process_subscription_batch(self, tasks: List[Dict]):
-        """Обрабатывает батч задач подписки"""
+        """Обрабатывает батч задач подписки с ДОПОЛНИТЕЛЬНЫМИ задержками"""
         if not tasks:
             return
         
         logger.info(f"📺 Обрабатываю {len(tasks)} задач подписки")
         
-        # Обрабатываем подписки ПОСЛЕДОВАТЕЛЬНО с увеличенными задержками
         success_count = 0
         
         for idx, task in enumerate(tasks):
@@ -343,25 +439,34 @@ class TaskWorker:
                 if success:
                     success_count += 1
                 
-                # Увеличенная задержка между подписками (30-60 секунд)
+                # УВЕЛИЧЕННЫЕ задержки между подписками в батче
                 if idx < len(tasks) - 1:  # Не ждем после последней
-                    delay = random.uniform(30, 60)
-                    logger.info(f"⏳ Пауза {delay:.1f}с перед следующей подпиской...")
+                    # Читаем актуальную задержку между аккаунтами
+                    accounts_delay_minutes = read_setting('accounts_delay.txt', 10.0)
+                    
+                    # Применяем задержку с рандомизацией
+                    delay = accounts_delay_minutes * 60 * random.uniform(0.8, 1.2)
+                    
+                    logger.info(f"⏳ Пауза {delay/60:.1f} мин перед следующей подпиской...")
                     await asyncio.sleep(delay)
                 
             except Exception as e:
                 logger.error(f"Ошибка обработки подписки: {e}")
         
-        logger.info(f"✅ Подписки: {success_count}/{len(tasks)} успешно")
-        logger.info("⏳ Пауза 2 минуты после батча подписок...")
-        await asyncio.sleep(120)  # Пауза 2 минуты после батча
+        logger.info(f"✅ Подписки в батче: {success_count}/{len(tasks)} успешно")
+        
+        # Дополнительная пауза после батча (читаем из настроек)
+        batch_pause_minutes = read_setting('timeout_duration.txt', 20.0)
+        batch_pause = batch_pause_minutes * 60
+        
+        logger.info(f"⏳ Пауза {batch_pause_minutes} мин после батча подписок...")
+        await asyncio.sleep(batch_pause)
     
     async def _execute_subscription_task(self, task: Dict) -> bool:
-        """Выполняет одну задачу подписки"""
+        """Выполняет одну задачу подписки с обработкой банов"""
         session_data = task['account_session']
         phone = task['phone']
         channel = task['channel']
-        lang = task['lang']
         
         try:
             # Получаем готовый клиент из пула
@@ -369,6 +474,7 @@ class TaskWorker:
             
             if not client:
                 logger.warning(f"❌ {phone}: клиент недоступен для подписки")
+                await self._handle_task_failure(phone, 'subscription')
                 return False
             
             # Получаем entity канала
@@ -376,16 +482,15 @@ class TaskWorker:
                 channel_entity = await client.get_entity(channel)
             except Exception as e:
                 logger.warning(f"❌ {phone}: не удалось получить канал @{channel}: {e}")
+                await self._handle_task_failure(phone, 'subscription')
                 return False
             
             # Выполняем подписку
             await client(JoinChannelRequest(channel_entity))
             
+            # УСПЕХ - сбрасываем счетчик неудач
+            await self._handle_task_success(phone)
             logger.info(f"✅ {phone}: подписан на @{channel}")
-            
-            # Сбрасываем счетчик ошибок при успешной подписке
-            await update_account_status(phone, 'active')  # Сбрасывает fail counter
-            
             return True
             
         except FloodWaitError as e:
@@ -393,20 +498,42 @@ class TaskWorker:
             await self._add_to_retry_queue(task, 'subscription', delay=e.seconds)
             return False
             
-        except RPCError as e:
-            if "FROZEN" in str(e):
-                logger.warning(f"🥶 {phone}: аккаунт заморожен")
-                await update_account_status(phone, 'pause')
-            elif "CHANNELS_TOO_MUCH" in str(e):
-                logger.warning(f"📺 {phone}: слишком много каналов")
-                await update_account_status(phone, 'pause')
-            else:
-                logger.error(f"❌ {phone}: RPC ошибка подписки - {e}")
+        except (RPCError, AuthKeyInvalidError) as e:
+            logger.warning(f"❌ {phone}: критическая ошибка подписки - {e}")
+            await self._handle_task_failure(phone, 'subscription')
             return False
             
         except Exception as e:
             logger.error(f"💥 {phone}: неожиданная ошибка подписки - {e}")
+            await self._handle_task_failure(phone, 'subscription')
             return False
+    
+    async def _handle_task_success(self, phone: str):
+        """Обрабатывает успешное выполнение задачи"""
+        try:
+            success = await reset_account_fails(phone)
+            if success:
+                logger.info(f"🔓 {phone}: восстановлен в active (счетчик неудач сброшен)")
+        except Exception as e:
+            logger.error(f"Ошибка обработки успеха для {phone}: {e}")
+
+    async def _handle_task_failure(self, phone: str, task_type: str):
+        """Обрабатывает неудачное выполнение задачи"""
+        try:
+            fail_count = await increment_account_fails(phone)
+            
+            if fail_count >= 3:
+                # Переводим в бан после 3 неудач
+                await update_account_status(phone, 'ban')
+                logger.warning(f"🚫 {phone}: переведен в BAN (неудач: {fail_count})")
+                
+                # Удаляем из пула сессий
+                await global_session_manager.remove_session_by_phone(phone)
+            else:
+                logger.info(f"⚠️ {phone}: неудача {fail_count}/3 ({task_type})")
+                
+        except Exception as e:
+            logger.error(f"Ошибка обработки неудачи для {phone}: {e}")
     
     async def _add_to_retry_queue(self, task: Dict, task_type: str, delay: int = 0):
         """Добавляет задачу в очередь повторов"""
@@ -416,7 +543,7 @@ class TaskWorker:
             task['retry_after'] = time.time() + delay + random.uniform(60, 300)  # Дополнительная задержка
             
             if task['retry_count'] <= self.max_retries:
-                self.redis_client.lpush('retry_tasks', str(task))
+                self.redis_client.lpush('retry_tasks', json.dumps(task))
                 logger.debug(f"🔄 Задача добавлена в retry (попытка {task['retry_count']}/{self.max_retries})")
             else:
                 logger.warning(f"❌ Задача отброшена после {self.max_retries} попыток")
@@ -435,7 +562,7 @@ class TaskWorker:
                     break
                 
                 try:
-                    task = eval(task_data)
+                    task = json.loads(task_data)
                     
                     # Проверяем время повтора
                     if task.get('retry_after', 0) <= current_time:
@@ -494,10 +621,7 @@ class TaskWorker:
             if self.redis_client:
                 self.redis_client.close()
             
-            # НЕ ЗАКРЫВАЕМ пул БД - он нужен для бота!
-            # await shutdown_db_pool()  # <-- Убираем эту строку
-            
-            logger.info("✅ Воркер корректно завершен (БД остается активной)")
+            logger.info("✅ Воркер корректно завершен (БД остается активная)")
             
         except Exception as e:
             logger.error(f"Ошибка при завершении: {e}")
