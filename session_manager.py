@@ -27,39 +27,16 @@ class SessionManager:
         self.loading_complete = False
         self.failed_sessions = set()
         self.max_sessions = MAX_SESSIONS_IN_MEMORY
-        self._loading_in_progress = False  # Защита от повторной загрузки
         
     async def preload_all_sessions(self) -> Dict[str, int]:
         """
         Предзагружает ВСЕ сессии в оперативную память
-        С ЗАЩИТОЙ от повторной загрузки
+        
+        Returns:
+            Dict с результатами загрузки
         """
-        
-        # ЗАЩИТА: Если уже загружено и есть активные сессии, не перезагружаем
-        if self.loading_complete and len(self.clients) > 0:
-            logger.info(f"✅ Сессии уже загружены ({len(self.clients)} активных), пропускаю перезагрузку")
-            return {
-                'total': len(self.clients),
-                'loaded': len(self.clients), 
-                'failed': len(self.failed_sessions),
-                'skipped': 0
-            }
-        
-        # ЗАЩИТА: Если идет загрузка в другом потоке
-        if self._loading_in_progress:
-            logger.warning("⚠️ Загрузка сессий уже в процессе, ожидаю...")
-            return {
-                'total': 0,
-                'loaded': 0,
-                'failed': 0,
-                'skipped': 0
-            }
-        
         logger.info("🚀 Начинаю предзагрузку всех сессий в RAM...")
         start_time = time.time()
-        
-        # Устанавливаем флаг загрузки
-        self._loading_in_progress = True
         
         results = {
             'total': 0,
@@ -77,37 +54,16 @@ class SessionManager:
                 logger.warning("❌ Нет активных аккаунтов для загрузки")
                 return results
             
-            # Проверяем сколько уже загружено
-            already_loaded = len(self.clients)
-            if already_loaded > 0:
-                logger.info(f"🔄 Уже загружено {already_loaded} сессий, загружаю остальные...")
-            
             logger.info(f"📱 Найдено {results['total']} активных аккаунтов")
-            
-            # Фильтруем уже загруженные аккаунты
-            accounts_to_load = []
-            for account in all_accounts:
-                session_data = account['session_data']
-                if session_data not in self.clients:
-                    accounts_to_load.append(account)
-                else:
-                    results['skipped'] += 1
-            
-            if not accounts_to_load:
-                logger.info("✅ Все аккаунты уже загружены")
-                self.loading_complete = True
-                return results
-            
-            logger.info(f"📝 К загрузке: {len(accounts_to_load)} новых аккаунтов")
             
             # Загружаем батчами чтобы не перегрузить Telegram API
             batch_size = 100
             batch_delay = 15  # секунд между батчами
             
-            for i in range(0, len(accounts_to_load), batch_size):
-                batch = accounts_to_load[i:i + batch_size]
+            for i in range(0, len(all_accounts), batch_size):
+                batch = all_accounts[i:i + batch_size]
                 batch_num = (i // batch_size) + 1
-                total_batches = (len(accounts_to_load) + batch_size - 1) // batch_size
+                total_batches = (len(all_accounts) + batch_size - 1) // batch_size
                 
                 logger.info(f"⏳ Загружаю батч {batch_num}/{total_batches} ({len(batch)} аккаунтов)...")
                 
@@ -119,7 +75,7 @@ class SessionManager:
                 results['skipped'] += batch_results['skipped']
                 
                 # Пауза между батчами (кроме последнего)
-                if i + batch_size < len(accounts_to_load):
+                if i + batch_size < len(all_accounts):
                     logger.info(f"😴 Пауза {batch_delay} секунд между батчами...")
                     await asyncio.sleep(batch_delay)
             
@@ -131,8 +87,7 @@ class SessionManager:
    ✅ Загружено: {results['loaded']}
    ❌ Ошибок: {results['failed']}
    ⏭️ Пропущено: {results['skipped']}
-   📊 Всего в пуле: {len(self.clients)}
-   📊 Успешность: {results['loaded']/max(len(accounts_to_load), 1)*100:.1f}%
+   📊 Успешность: {results['loaded']/results['total']*100:.1f}%
    💾 Занято RAM: ~{len(self.clients) * 0.2:.1f} МБ
             """)
             
@@ -141,10 +96,6 @@ class SessionManager:
         except Exception as e:
             logger.error(f"💥 Критическая ошибка предзагрузки: {e}")
             raise SessionError(f"Session preloading failed: {e}")
-            
-        finally:
-            # Убираем флаг загрузки
-            self._loading_in_progress = False
     
     async def _load_batch(self, accounts_batch: List[Dict]) -> Dict[str, int]:
         """Загружает батч аккаунтов параллельно"""
@@ -522,7 +473,6 @@ class SessionManager:
         self.session_info.clear()
         self.failed_sessions.clear()
         self.loading_complete = False
-        self._loading_in_progress = False
         
         logger.info("✅ Все сессии закрыты")
     

@@ -86,16 +86,13 @@ class TaskWorker:
                 logger.info(f"✅ Предзагрузка завершена: {results['loaded']} сессий готово к работе")
                 self.sessions_loaded = True
                 
-            # ВАЖНО: Обновляем статус из session_manager
-            self.sessions_loaded = global_session_manager.loading_complete
-                
         except Exception as e:
             logger.error(f"❌ Ошибка при загрузке сессий: {e}")
             logger.info("💡 Воркер продолжит работу в режиме ожидания аккаунтов...")
             self.sessions_loaded = False
     
     async def _main_loop(self):
-        """Основной цикл обработки задач с УМНОЙ проверкой сессий"""
+        """Основной цикл обработки задач с проверкой забаненных аккаунтов"""
         logger.info("🔄 Запуск основного цикла обработки задач")
         
         # Счетчики для статистики
@@ -104,37 +101,22 @@ class TaskWorker:
         last_stats_time = time.time()
         last_session_check = time.time()
         last_ban_check = time.time()
-        last_health_check = time.time()
         
         while self.running:
             try:
-                # УМНАЯ проверка сессий - только если действительно нужно
-                current_time = time.time()
-                
-                # 1. Если сессии НЕ загружены, проверяем каждые 5 минут
-                if not self.sessions_loaded and current_time - last_session_check > 300:
+                # Если сессии не загружены, пытаемся загрузить каждые 5 минут
+                if not self.sessions_loaded and time.time() - last_session_check > 300:
                     logger.info("🔍 Проверяю появление новых аккаунтов...")
                     await self._try_preload_sessions()
-                    last_session_check = current_time
-                
-                # 2. Если сессии загружены, но session_manager говорит что нет - синхронизируем
-                elif self.sessions_loaded and not global_session_manager.loading_complete:
-                    logger.warning("⚠️ Рассинхронизация статуса сессий, исправляю...")
-                    self.sessions_loaded = global_session_manager.loading_complete
-                    
-                # 3. Если долго нет новых аккаунтов, проверяем раз в час
-                elif self.sessions_loaded and len(global_session_manager.clients) == 0 and current_time - last_session_check > 3600:
-                    logger.info("🔍 Периодическая проверка новых аккаунтов (раз в час)...")
-                    await self._try_preload_sessions()
-                    last_session_check = current_time
+                    last_session_check = time.time()
                 
                 # Проверка забаненных аккаунтов (раз в час)
-                if current_time - last_ban_check > 3600:
+                if time.time() - last_ban_check > 3600:
                     await self._check_banned_accounts_for_retry()
-                    last_ban_check = current_time
+                    last_ban_check = time.time()
                 
-                # Основная работа - только если сессии загружены
-                if self.sessions_loaded and len(global_session_manager.clients) > 0:
+                # Если сессии загружены, обрабатываем задачи
+                if self.sessions_loaded:
                     # Обрабатываем отложенные просмотры
                     view_tasks = await self._get_ready_view_tasks()
                     if view_tasks:
@@ -150,16 +132,15 @@ class TaskWorker:
                     # Обрабатываем retry задачи
                     await self._process_retry_tasks()
                     
-                    # Health check сессий каждые 30 минут (было 15)
-                    if current_time - last_health_check > 1800:
+                    # Health check сессий каждые 15 минут
+                    if random.random() < 0.01:  # ~1% шанс = примерно раз в 15 минут
                         health_stats = await global_session_manager.health_check()
                         if health_stats.get('removed_dead', 0) > 0:
                             logger.info(f"🔧 Очищено {health_stats['removed_dead']} мертвых сессий")
-                        last_health_check = current_time
                 
                 # Статистика каждые 5 минут
-                if current_time - last_stats_time > 300:
-                    if self.sessions_loaded and len(global_session_manager.clients) > 0:
+                if time.time() - last_stats_time > 300:
+                    if self.sessions_loaded:
                         session_stats = await global_session_manager.get_stats()
                         logger.info(f"""
 📊 Статистика за 5 минут:
@@ -167,20 +148,14 @@ class TaskWorker:
    📺 Подписок: {processed_subs}
    🧠 Сессий активно: {session_stats['connected']}/{session_stats['total_loaded']}
                         """)
-                    elif self.sessions_loaded:
-                        logger.info("⏳ Сессии загружены, но аккаунтов нет в пуле")
                     else:
                         logger.info("⏳ Воркер активен, ожидаю загрузки аккаунтов...")
                     
                     processed_views = processed_subs = 0
-                    last_stats_time = current_time
+                    last_stats_time = time.time()
                 
-                # Пауза между циклами
-                if self.sessions_loaded and len(global_session_manager.clients) > 0:
-                    sleep_time = 5  # Активная работа - короткие паузы
-                else:
-                    sleep_time = 30  # Ожидание - длинные паузы
-                    
+                # Пауза между циклами (больше если нет сессий)
+                sleep_time = 5 if self.sessions_loaded else 30
                 await asyncio.sleep(sleep_time)
                 
             except KeyboardInterrupt:
@@ -620,6 +595,9 @@ class TaskWorker:
             # Закрываем Redis
             if self.redis_client:
                 self.redis_client.close()
+            
+            # НЕ ЗАКРЫВАЕМ пул БД - он нужен для бота!
+            # await shutdown_db_pool()  # <-- Убираем эту строку
             
             logger.info("✅ Воркер корректно завершен (БД остается активная)")
             
