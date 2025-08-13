@@ -30,8 +30,11 @@ REDIS_PASSWORD = os.getenv('REDIS_PASSWORD', Path('vars/password.txt').read_text
 MAX_SESSIONS_IN_MEMORY = int(os.getenv('MAX_SESSIONS', '25000'))
 SESSION_CACHE_TTL = int(os.getenv('SESSION_TTL', '3600'))  # 1 час
 
-# === Task Processing ===
-VIEW_TASK_DURATION = int(os.getenv('VIEW_DURATION_HOURS', '10')) * 3600  # 10 часов
+def get_view_task_duration() -> int:
+    """Получает длительность просмотров из настроек (в секундах)"""
+    hours = read_setting('followPeriod.txt')  # По умолчанию 1 час
+    return int(hours * 3600)
+
 BATCH_SIZE = int(os.getenv('BATCH_SIZE', '1000'))
 MAX_RETRIES = int(os.getenv('MAX_RETRIES', '3'))
 
@@ -55,7 +58,6 @@ def get_whitelist():
     except:
         return []
 
-# === Dynamic Settings (from files) ===
 def read_setting(filename: str, default: float = 0.0) -> float:
     """Читает настройку из файла vars/"""
     try:

@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from enum import Enum
 
 from config import (
-    VIEW_TASK_DURATION, BATCH_SIZE, read_setting, 
+    BATCH_SIZE, read_setting, 
     find_english_word, find_lang_code
 )
 from database import get_accounts_by_lang, get_channels_by_lang
@@ -33,16 +33,26 @@ class TaskItem:
     execute_at: Optional[float] = None
     retry_count: int = 0
 
-class TaskService:
-    """Сервис для управления задачами с батчингом"""
+class ShardedTaskService:
+    """
+    МАСШТАБИРУЕМЫЙ сервис для управления задачами с ШАРДИНГОМ
+    Оптимизирован для больших нагрузок (1500+ аккаунтов)
+    """
     
     def __init__(self):
         self.batch_size = BATCH_SIZE
-        self.view_duration = VIEW_TASK_DURATION
+        # ✅ НАСТРОЙКИ ШАРДИНГА
+        self.view_shard_interval = 30 * 60  # 30 минут на шард (просмотры)
+        self.subscription_shard_interval = 60 * 60  # 60 минут на шард (подписки)
+        
+    def get_view_duration(self) -> int:
+        """Получает актуальную длительность просмотров из настроек"""
+        hours = read_setting('followPeriod.txt', 10.0)  # Для больших нагрузок используем 10 часов
+        return int(hours * 3600)
         
     async def create_view_tasks_for_post(self, channel_username: str, post_id: int) -> Dict[str, int]:
         """
-        Создает задачи просмотра для поста с распределением на 10 часов
+        Создает задачи просмотра с ШАРДИНГОМ для масштабируемости
         
         Returns:
             Dict с результатами создания задач
@@ -50,10 +60,17 @@ class TaskService:
         results = {
             'total_tasks': 0,
             'batches_created': 0,
+            'shards_created': 0,
             'languages': 0
         }
         
         try:
+            # ✅ ЧИТАЕМ АКТУАЛЬНУЮ ДЛИТЕЛЬНОСТЬ ИЗ НАСТРОЕК
+            view_duration = self.get_view_duration()
+            view_hours = view_duration / 3600
+            
+            logger.info(f"📊 Настройка просмотров: {view_hours} часов (из followPeriod.txt)")
+            
             # 1. Получаем языки канала из БД
             languages = await self._get_channel_languages(channel_username)
             if not languages:
@@ -90,23 +107,25 @@ class TaskService:
                 logger.warning("⚠ Нет задач для создания")
                 return results
             
-            # 3. Создаем отложенные батчи на 10 часов
-            batches = await self._create_delayed_view_batches(all_tasks, post_id)
+            # 3. Создаем ШАРДИРОВАННЫЕ батчи
+            batches, shards_count = await self._create_sharded_view_batches(all_tasks, post_id, view_duration)
             results['batches_created'] = len(batches)
+            results['shards_created'] = shards_count
             
             logger.info(f"""
-📊 Создано задач просмотра для поста {post_id}:
+📊 Создано ШАРДИРОВАННЫХ задач просмотра для поста {post_id}:
    📱 Всего задач: {results['total_tasks']}
    🌐 Языков: {results['languages']}  
    📦 Батчей: {results['batches_created']}
-   ⏰ Распределение: 10 часов
+   🗂️ Шардов: {results['shards_created']}
+   ⏰ Распределение: {view_hours} часов
             """)
             
             return results
             
         except Exception as e:
-            logger.error(f"💥 Ошибка создания задач просмотра: {e}")
-            raise TaskProcessingError(f"Failed to create view tasks: {e}")
+            logger.error(f"💥 Ошибка создания шардированных задач просмотра: {e}")
+            raise TaskProcessingError(f"Failed to create sharded view tasks: {e}")
     
     async def _get_channel_languages(self, channel_username: str) -> List[str]:
         """Получает языки канала из БД"""
@@ -122,72 +141,102 @@ class TaskService:
             logger.error(f"Ошибка получения языков канала: {e}")
             return []
     
-    async def _create_delayed_view_batches(self, all_tasks: List[TaskItem], post_id: int) -> List[Dict]:
-        """Создает отложенные батчи с равномерным распределением на 10 часов"""
+    async def _create_sharded_view_batches(self, all_tasks: List[TaskItem], post_id: int, duration_seconds: int) -> tuple[List[Dict], int]:
+        """
+        МАСШТАБИРУЕМОЕ создание батчей с ШАРДИНГОМ по времени
+        """
         
         if not all_tasks:
-            return []
+            return [], 0
         
         # Перемешиваем задачи для равномерности
         random.shuffle(all_tasks)
         
         total_accounts = len(all_tasks)
-        duration_seconds = self.view_duration  # 10 часов в секундах
         
-        logger.info(f"📊 Распределение {total_accounts} аккаунтов на {duration_seconds/3600:.1f} часов")
+        logger.info(f"📊 Пост {post_id}: ШАРДИНГ {total_accounts} аккаунтов на {duration_seconds/3600:.1f} часов")
         
-        # Рассчитываем интервал между ОТДЕЛЬНЫМИ аккаунтами
+        # ✅ АДАПТИВНАЯ ОПТИМИЗАЦИЯ в зависимости от количества аккаунтов
+        if total_accounts <= 100:
+            # Малая нагрузка - сжимаем время
+            effective_duration = duration_seconds // 4  # 2.5 часа вместо 10
+            shard_interval = 15 * 60  # 15-минутные шарды
+            logger.info(f"🚀 Малая нагрузка - ускоряем до {effective_duration/3600:.1f} часов")
+        elif total_accounts <= 500:
+            # Средняя нагрузка
+            effective_duration = duration_seconds // 2  # 5 часов
+            shard_interval = 20 * 60  # 20-минутные шарды
+            logger.info(f"⚡ Средняя нагрузка - ускоряем до {effective_duration/3600:.1f} часов")
+        else:
+            # Большая нагрузка - используем полное время
+            effective_duration = duration_seconds
+            shard_interval = self.view_shard_interval  # 30-минутные шарды
+            logger.info(f"🏗️ Большая нагрузка - полное время {effective_duration/3600:.1f} часов")
+        
+        # Рассчитываем интервал между аккаунтами
         if total_accounts > 1:
-            interval_per_account = duration_seconds / (total_accounts - 1)
+            interval_per_account = effective_duration / (total_accounts - 1)
         else:
             interval_per_account = 0
         
-        logger.info(f"⏱️ Интервал между аккаунтами: {interval_per_account/60:.1f} минут")
+        # ✅ МИНИМАЛЬНЫЙ интервал для стабильности
+        interval_per_account = max(interval_per_account, 10)  # Минимум 10 секунд
         
-        # Создаем задачи с индивидуальным временем выполнения
+        logger.info(f"⏱️ Интервал между аккаунтами: {interval_per_account:.1f} секунд")
+        
+        # ✅ СОЗДАЕМ ЗАДАЧИ С ШАРДИНГОМ
         current_time = time.time()
         batches = []
+        shards_map = {}  # shard_id -> list of batches
         
-        # Группируем по 1 задаче (каждый аккаунт = отдельный батч)
         for idx, task in enumerate(all_tasks):
-            # Время выполнения для этого аккаунта
+            # Время выполнения для этого аккаунта  
             execute_at = current_time + (idx * interval_per_account)
             
-            # Добавляем небольшую рандомизацию (±2 минуты)
-            randomization = random.uniform(-120, 120)  # ±2 минуты
+            # Небольшая рандомизация (±30 сек)
+            randomization = random.uniform(-30, 30)
             execute_at += randomization
+            
+            # ✅ ОПРЕДЕЛЯЕМ ШАРД по времени выполнения
+            shard_id = int((execute_at - current_time) // shard_interval)
             
             # Устанавливаем время выполнения
             task.execute_at = execute_at
             
             batch_info = {
                 'batch_number': idx + 1,
-                'tasks': [task],  # Один аккаунт на батч
+                'tasks': [task],
                 'execute_at': execute_at,
                 'delay_minutes': (execute_at - current_time) / 60,
-                'account_phone': task.phone
+                'account_phone': task.phone,
+                'post_id': post_id,
+                'shard_id': shard_id
             }
             
-            batches.append(batch_info)
+            # Добавляем в соответствующий шард
+            if shard_id not in shards_map:
+                shards_map[shard_id] = []
+            shards_map[shard_id].append(batch_info)
             
-            # Логируем каждый 100-й батч для отслеживания
-            if (idx + 1) % 100 == 0 or idx == len(all_tasks) - 1:
-                logger.info(f"📦 Батч {idx + 1}/{total_accounts}: @{task.phone} через {batch_info['delay_minutes']:.1f} мин")
+            batches.append(batch_info)
         
-        # Отправляем батчи в очередь обработки
-        await self._schedule_batches(batches, post_id)
+        # ✅ ПЛАНИРУЕМ ШАРДИРОВАННЫЕ БАТЧИ
+        shards_count = len(shards_map)
+        await self._schedule_sharded_batches(shards_map, post_id, current_time, shard_interval)
         
         logger.info(f"""
-✅ Создано {len(batches)} индивидуальных батчей:
-   ⏰ Первый аккаунт: сейчас
-   ⏰ Последний аккаунт: через {duration_seconds/3600:.1f} часов
-   📊 Интервал: {interval_per_account/60:.2f} минут между аккаунтами
+✅ Пост {post_id}: создано {len(batches)} батчей в {shards_count} шардах
+   ⏰ Первый: сейчас  
+   ⏰ Последний: через {effective_duration/3600:.1f} ч
+   📊 Интервал: {interval_per_account:.1f} сек
+   🗂️ Шардов: {shards_count} × {shard_interval//60} мин
         """)
         
-        return batches
+        return batches, shards_count
     
-    async def _schedule_batches(self, batches: List[Dict], post_id: int):
-        """Планирует выполнение батчей через Redis/FastStream"""
+    async def _schedule_sharded_batches(self, shards_map: Dict[int, List[Dict]], post_id: int, 
+                                      base_time: float, shard_interval: int):
+        """Планирует батчи в ШАРДИРОВАННЫЕ очереди"""
         try:
             from redis import Redis
             from config import REDIS_HOST, REDIS_PORT, REDIS_PASSWORD
@@ -199,48 +248,101 @@ class TaskService:
                 decode_responses=True
             )
             
-            for batch_info in batches:
-                # Сериализуем данные батча
-                batch_data = {
-                    'batch_number': batch_info['batch_number'],
-                    'execute_at': batch_info['execute_at'],
-                    'post_id': post_id,
-                    'tasks': [
-                        {
-                            'account_session': task.account_session,
-                            'phone': task.phone,
-                            'channel': task.channel,
-                            'lang': task.lang,
-                            'post_id': task.post_id,
-                            'execute_at': task.execute_at
-                        }
-                        for task in batch_info['tasks']
-                    ]
-                }
-                
-                # Добавляем в очередь Redis
-                queue_key = f"delayed_view_batches"
-                redis_client.lpush(queue_key, json.dumps(batch_data))
-                
-                # Устанавливаем TTL на 12 часов (с запасом)
-                redis_client.expire(queue_key, 12 * 3600)
+            logger.info(f"📋 Планирую {len(shards_map)} шардов для поста {post_id}")
             
-            logger.info(f"📋 Запланировано {len(batches)} батчей в Redis")
+            total_scheduled = 0
+            
+            for shard_id, shard_batches in shards_map.items():
+                # ✅ КЛЮЧ ШАРДА включает время начала для уникальности
+                shard_start_time = base_time + (shard_id * shard_interval)
+                shard_key = f"view_shard_{int(shard_start_time)}_{shard_id}"
+                
+                # Готовим данные для шарда
+                shard_data = {}
+                for batch_info in shard_batches:
+                    batch_data = {
+                        'batch_number': batch_info['batch_number'],
+                        'execute_at': batch_info['execute_at'],
+                        'post_id': post_id,
+                        'task_type': 'view',
+                        'shard_id': shard_id,
+                        'tasks': [
+                            {
+                                'account_session': task.account_session,
+                                'phone': task.phone,
+                                'channel': task.channel,
+                                'lang': task.lang,
+                                'post_id': task.post_id,
+                                'execute_at': task.execute_at
+                            }
+                            for task in batch_info['tasks']
+                        ]
+                    }
+                    
+                    shard_data[json.dumps(batch_data)] = batch_info['execute_at']
+                
+                # ✅ ЗАПИСЫВАЕМ ШАРД в Redis
+                if shard_data:
+                    redis_client.zadd(shard_key, shard_data)
+                    
+                    # TTL на 24 часа
+                    redis_client.expire(shard_key, 24 * 3600)
+                    
+                    total_scheduled += len(shard_batches)
+                    
+                    logger.info(f"  📦 Шард {shard_id}: {len(shard_batches)} батчей → {shard_key}")
+            
+            # ✅ РЕГИСТРИРУЕМ АКТИВНЫЕ ШАРДЫ для воркера
+            await self._register_active_shards(redis_client, shards_map.keys(), base_time, shard_interval, post_id)
+            
+            logger.info(f"✅ Пост {post_id}: {total_scheduled} батчей в {len(shards_map)} шардах")
             
         except Exception as e:
-            logger.error(f"Ошибка планирования батчей: {e}")
-            raise TaskProcessingError(f"Failed to schedule batches: {e}")
+            logger.error(f"Ошибка планирования шардированных батчей: {e}")
+            raise TaskProcessingError(f"Failed to schedule sharded batches: {e}")
+    
+    async def _register_active_shards(self, redis_client, shard_ids: List[int], 
+                                    base_time: float, shard_interval: int, post_id: int):
+        """Регистрирует активные шарды для эффективного поиска воркером"""
+        try:
+            active_shards_key = "active_view_shards"
+            
+            for shard_id in shard_ids:
+                shard_start_time = base_time + (shard_id * shard_interval)
+                shard_key = f"view_shard_{int(shard_start_time)}_{shard_id}"
+                
+                # Метаданные шарда для воркера
+                shard_meta = {
+                    'shard_key': shard_key,
+                    'shard_id': shard_id,
+                    'start_time': shard_start_time,
+                    'end_time': shard_start_time + shard_interval,
+                    'post_id': post_id,
+                    'type': 'view'
+                }
+                
+                # Добавляем в реестр активных шардов (сортировка по времени начала)
+                redis_client.zadd(active_shards_key, {json.dumps(shard_meta): shard_start_time})
+            
+            # TTL на 48 часов
+            redis_client.expire(active_shards_key, 48 * 3600)
+            
+            logger.info(f"📋 Зарегистрировано {len(shard_ids)} активных шардов")
+            
+        except Exception as e:
+            logger.error(f"Ошибка регистрации активных шардов: {e}")
     
     async def create_subscription_tasks(self, channel_name: str, target_lang: str) -> Dict[str, int]:
         """
-        Создает задачи подписки с ПРАВИЛЬНЫМИ умными задержками
+        Создает задачи подписки с ШАРДИНГОМ для масштабируемости
         
         Returns:
             Dict с результатами создания задач
         """
         results = {
             'total_tasks': 0,
-            'accounts_processed': 0
+            'accounts_processed': 0,
+            'shards_created': 0
         }
         
         try:
@@ -258,13 +360,14 @@ class TaskService:
             params = await self._get_subscription_delays()
             
             logger.info(f"""
-📊 Параметры подписок для канала @{channel_name}:
+📊 Параметры ШАРДИРОВАННЫХ подписок для канала @{channel_name}:
    📱 Аккаунтов: {len(accounts)}
    ⏰ Базовая задержка: {params['base_delay']/60:.1f} мин
    🎲 Разброс: ±{params['range_val']/60:.1f} мин
    👥 Между аккаунтами: {params['accounts_delay']/60:.1f} мин
    🔢 Подписок до паузы: {params['timeout_count']}
    ⏸️ Пауза: {params['timeout_duration']/60:.1f} мин
+   🗂️ Шардинг: {self.subscription_shard_interval//60} мин на шард
             """)
             
             # Перемешиваем аккаунты для равномерности
@@ -292,23 +395,20 @@ class TaskService:
                 )
                 
                 subscription_tasks.append(task)
-                
-                # Логируем каждые 50 аккаунтов
-                if (account_idx + 1) % 50 == 0 or account_idx == len(accounts) - 1:
-                    delay_minutes = delay_seconds / 60
-                    logger.info(f"📅 Аккаунт {account_idx + 1}/{len(accounts)}: @{account['phone_number']} через {delay_minutes:.1f} мин")
             
             results['total_tasks'] = len(subscription_tasks)
             
-            # Отправляем задачи в очередь с временными метками
-            await self._schedule_subscription_tasks_with_delays(subscription_tasks)
+            # ✅ ПЛАНИРУЕМ В ШАРДИРОВАННЫХ ОЧЕРЕДЯХ
+            shards_count = await self._schedule_sharded_subscription_tasks(subscription_tasks, channel_name)
+            results['shards_created'] = shards_count
             
             # Статистика по времени
             total_duration_hours = max(task.execute_at - current_time for task in subscription_tasks) / 3600
             
             logger.info(f"""
-✅ Создано {results['total_tasks']} задач подписки:
+✅ Создано {results['total_tasks']} ШАРДИРОВАННЫХ задач подписки:
    📅 Длительность: {total_duration_hours:.1f} часов
+   🗂️ Шардов: {results['shards_created']}
    ⚡ Первая подписка: через {min(task.execute_at - current_time for task in subscription_tasks)/60:.1f} мин
    🏁 Последняя подписка: через {total_duration_hours:.1f} часов
             """)
@@ -316,8 +416,8 @@ class TaskService:
             return results
             
         except Exception as e:
-            logger.error(f"💥 Ошибка создания задач подписки: {e}")
-            raise TaskProcessingError(f"Failed to create subscription tasks: {e}")
+            logger.error(f"💥 Ошибка создания шардированных задач подписки: {e}")
+            raise TaskProcessingError(f"Failed to create sharded subscription tasks: {e}")
     
     async def _get_subscription_delays(self) -> Dict[str, float]:
         """Получает параметры задержек подписок из файлов"""
@@ -365,8 +465,8 @@ class TaskService:
         
         return total_delay
     
-    async def _schedule_subscription_tasks_with_delays(self, tasks: List[TaskItem]):
-        """Планирует задачи подписки с учетом времени выполнения"""
+    async def _schedule_sharded_subscription_tasks(self, tasks: List[TaskItem], channel_name: str) -> int:
+        """Планирует задачи подписки в ШАРДИРОВАННЫХ очередях"""
         try:
             from redis import Redis
             from config import REDIS_HOST, REDIS_PORT, REDIS_PASSWORD
@@ -381,32 +481,97 @@ class TaskService:
             # Сортируем задачи по времени выполнения
             tasks.sort(key=lambda x: x.execute_at)
             
+            logger.info(f"📋 Планирую {len(tasks)} задач подписки в ШАРДИРОВАННЫХ очередях:")
+            
+            # ✅ ГРУППИРУЕМ ЗАДАЧИ ПО ШАРДАМ
+            current_time = time.time()
+            shards_map = {}
+            
             for task in tasks:
-                task_data = {
-                    'account_session': task.account_session,
-                    'phone': task.phone,
-                    'channel': task.channel,
-                    'lang': task.lang,
-                    'task_type': task.task_type.value,
-                    'execute_at': task.execute_at,  # ВАЖНО: сохраняем время выполнения
-                    'retry_count': task.retry_count,
-                    'created_at': time.time()
-                }
+                # Определяем шард по времени выполнения
+                time_offset = task.execute_at - current_time
+                shard_id = int(time_offset // self.subscription_shard_interval)
                 
-                # Добавляем в очередь подписок
-                redis_client.lpush("subscription_tasks", json.dumps(task_data))
+                if shard_id not in shards_map:
+                    shards_map[shard_id] = []
+                shards_map[shard_id].append(task)
             
-            # TTL на 48 часов (с запасом)
-            redis_client.expire("subscription_tasks", 48 * 3600)
+            # ✅ СОЗДАЕМ ШАРДЫ И ЗАПИСЫВАЕМ В REDIS
+            scheduled_count = 0
             
-            logger.info(f"📋 Запланировано {len(tasks)} задач подписки с временными метками")
+            for shard_id, shard_tasks in shards_map.items():
+                shard_start_time = current_time + (shard_id * self.subscription_shard_interval)
+                shard_key = f"sub_shard_{int(shard_start_time)}_{shard_id}"
+                
+                shard_data = {}
+                
+                for task in shard_tasks:
+                    task_data = {
+                        'account_session': task.account_session,
+                        'phone': task.phone,
+                        'channel': task.channel,
+                        'lang': task.lang,
+                        'task_type': 'subscription',
+                        'execute_at': task.execute_at,
+                        'retry_count': task.retry_count,
+                        'created_at': time.time(),
+                        'shard_id': shard_id
+                    }
+                    
+                    shard_data[json.dumps(task_data)] = task.execute_at
+                
+                # Записываем шард в Redis
+                if shard_data:
+                    redis_client.zadd(shard_key, shard_data)
+                    redis_client.expire(shard_key, 48 * 3600)  # TTL 48 часов
+                    
+                    scheduled_count += len(shard_tasks)
+                    
+                    avg_delay = sum(t.execute_at - current_time for t in shard_tasks) / len(shard_tasks) / 60
+                    logger.info(f"  📦 Шард {shard_id}: {len(shard_tasks)} задач (среднее: {avg_delay:.1f} мин)")
+            
+            # ✅ РЕГИСТРИРУЕМ АКТИВНЫЕ ШАРДЫ ПОДПИСОК
+            await self._register_active_subscription_shards(redis_client, shards_map.keys(), 
+                                                          current_time, channel_name)
+            
+            logger.info(f"✅ Канал @{channel_name}: {scheduled_count} задач в {len(shards_map)} шардах")
+            
+            return len(shards_map)
             
         except Exception as e:
-            logger.error(f"Ошибка планирования задач подписки: {e}")
-            raise TaskProcessingError(f"Failed to schedule subscription tasks: {e}")
+            logger.error(f"Ошибка планирования шардированных задач подписки: {e}")
+            raise TaskProcessingError(f"Failed to schedule sharded subscription tasks: {e}")
+    
+    async def _register_active_subscription_shards(self, redis_client, shard_ids: List[int], 
+                                                 base_time: float, channel_name: str):
+        """Регистрирует активные шарды подписок"""
+        try:
+            active_shards_key = "active_subscription_shards"
+            
+            for shard_id in shard_ids:
+                shard_start_time = base_time + (shard_id * self.subscription_shard_interval)
+                shard_key = f"sub_shard_{int(shard_start_time)}_{shard_id}"
+                
+                shard_meta = {
+                    'shard_key': shard_key,
+                    'shard_id': shard_id,
+                    'start_time': shard_start_time,
+                    'end_time': shard_start_time + self.subscription_shard_interval,
+                    'channel': channel_name,
+                    'type': 'subscription'
+                }
+                
+                redis_client.zadd(active_shards_key, {json.dumps(shard_meta): shard_start_time})
+            
+            redis_client.expire(active_shards_key, 48 * 3600)
+            
+            logger.info(f"📋 Зарегистрировано {len(shard_ids)} активных шардов подписок")
+            
+        except Exception as e:
+            logger.error(f"Ошибка регистрации шардов подписок: {e}")
     
     async def get_task_stats(self) -> Dict[str, int]:
-        """Получает статистику задач из Redis"""
+        """Получает статистику задач из ШАРДИРОВАННЫХ очередей"""
         try:
             from redis import Redis
             from config import REDIS_HOST, REDIS_PORT, REDIS_PASSWORD
@@ -418,9 +583,46 @@ class TaskService:
                 decode_responses=True
             )
             
+            current_time = time.time()
+            
+            # Статистика по шардам просмотров
+            view_shards = redis_client.zcount("active_view_shards", 0, "+inf")
+            view_ready_shards = redis_client.zcount("active_view_shards", 0, current_time + 1800)  # +30 мин
+            
+            # Статистика по шардам подписок
+            sub_shards = redis_client.zcount("active_subscription_shards", 0, "+inf")
+            sub_ready_shards = redis_client.zcount("active_subscription_shards", 0, current_time + 3600)  # +1 час
+            
+            # Примерная оценка задач (анализируем несколько шардов)
+            estimated_view_tasks = 0
+            estimated_sub_tasks = 0
+            
+            # Берем образцы активных шардов для оценки
+            sample_view_shards = redis_client.zrange("active_view_shards", 0, 5)
+            for shard_meta_json in sample_view_shards:
+                try:
+                    shard_meta = json.loads(shard_meta_json)
+                    shard_size = redis_client.zcard(shard_meta['shard_key'])
+                    estimated_view_tasks += shard_size
+                except:
+                    pass
+            
+            sample_sub_shards = redis_client.zrange("active_subscription_shards", 0, 5)
+            for shard_meta_json in sample_sub_shards:
+                try:
+                    shard_meta = json.loads(shard_meta_json)
+                    shard_size = redis_client.zcard(shard_meta['shard_key'])
+                    estimated_sub_tasks += shard_size
+                except:
+                    pass
+            
             stats = {
-                'pending_view_batches': redis_client.llen("delayed_view_batches"),
-                'pending_subscriptions': redis_client.llen("subscription_tasks"),
+                'view_shards_total': view_shards,
+                'view_shards_ready': view_ready_shards,
+                'subscription_shards_total': sub_shards,
+                'subscription_shards_ready': sub_ready_shards,
+                'estimated_view_tasks': estimated_view_tasks,
+                'estimated_subscription_tasks': estimated_sub_tasks,
                 'retry_queue': redis_client.llen("retry_tasks"),
                 'session_pool_size': len(global_session_manager.clients),
                 'session_pool_loaded': global_session_manager.loading_complete
@@ -429,8 +631,100 @@ class TaskService:
             return stats
             
         except Exception as e:
-            logger.error(f"Ошибка получения статистики задач: {e}")
+            logger.error(f"Ошибка получения статистики шардированных задач: {e}")
             return {}
+    
+    async def cleanup_expired_shards(self) -> Dict[str, int]:
+        """Очищает истекшие шарды для освобождения памяти"""
+        try:
+            from redis import Redis
+            from config import REDIS_HOST, REDIS_PORT, REDIS_PASSWORD
+            
+            redis_client = Redis(
+                host=REDIS_HOST,
+                port=REDIS_PORT,
+                password=REDIS_PASSWORD,
+                decode_responses=True
+            )
+            
+            current_time = time.time()
+            cleanup_stats = {
+                'expired_view_shards': 0,
+                'expired_subscription_shards': 0,
+                'freed_memory_mb': 0
+            }
+            
+            # Очищаем истекшие шарды просмотров (старше 12 часов)
+            expired_view_threshold = current_time - (12 * 3600)
+            expired_view_shards = redis_client.zrangebyscore(
+                "active_view_shards", 
+                0, 
+                expired_view_threshold,
+                withscores=False
+            )
+            
+            for shard_meta_json in expired_view_shards:
+                try:
+                    shard_meta = json.loads(shard_meta_json)
+                    shard_key = shard_meta['shard_key']
+                    
+                    # Оцениваем размер перед удалением
+                    shard_size = redis_client.zcard(shard_key)
+                    cleanup_stats['freed_memory_mb'] += shard_size * 0.5 / 1024  # Примерная оценка
+                    
+                    # Удаляем шард
+                    redis_client.delete(shard_key)
+                    redis_client.zrem("active_view_shards", shard_meta_json)
+                    
+                    cleanup_stats['expired_view_shards'] += 1
+                    
+                    logger.debug(f"🗑️ Удален истекший шард просмотров: {shard_key} ({shard_size} задач)")
+                    
+                except Exception as e:
+                    logger.error(f"Ошибка очистки шарда просмотров: {e}")
+            
+            # Очищаем истекшие шарды подписок (старше 48 часов)
+            expired_sub_threshold = current_time - (48 * 3600)
+            expired_sub_shards = redis_client.zrangebyscore(
+                "active_subscription_shards", 
+                0, 
+                expired_sub_threshold,
+                withscores=False
+            )
+            
+            for shard_meta_json in expired_sub_shards:
+                try:
+                    shard_meta = json.loads(shard_meta_json)
+                    shard_key = shard_meta['shard_key']
+                    
+                    # Оцениваем размер перед удалением
+                    shard_size = redis_client.zcard(shard_key)
+                    cleanup_stats['freed_memory_mb'] += shard_size * 0.5 / 1024
+                    
+                    # Удаляем шард
+                    redis_client.delete(shard_key)
+                    redis_client.zrem("active_subscription_shards", shard_meta_json)
+                    
+                    cleanup_stats['expired_subscription_shards'] += 1
+                    
+                    logger.debug(f"🗑️ Удален истекший шард подписок: {shard_key} ({shard_size} задач)")
+                    
+                except Exception as e:
+                    logger.error(f"Ошибка очистки шарда подписок: {e}")
+            
+            if cleanup_stats['expired_view_shards'] > 0 or cleanup_stats['expired_subscription_shards'] > 0:
+                logger.info(f"""
+🧹 Очистка истекших шардов:
+   👀 Шардов просмотров: {cleanup_stats['expired_view_shards']}
+   📺 Шардов подписок: {cleanup_stats['expired_subscription_shards']}
+   💾 Освобождено памяти: {cleanup_stats['freed_memory_mb']:.1f} МБ
+                """)
+            
+            return cleanup_stats
+            
+        except Exception as e:
+            logger.error(f"Ошибка очистки истекших шардов: {e}")
+            return {'expired_view_shards': 0, 'expired_subscription_shards': 0, 'freed_memory_mb': 0}
 
-# Глобальный экземпляр сервиса
-task_service = TaskService()
+# Глобальный экземпляр ШАРДИРОВАННОГО сервиса
+task_service = ShardedTaskService()

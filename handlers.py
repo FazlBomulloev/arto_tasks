@@ -1,5 +1,7 @@
 import asyncio
 import logging
+import json
+import random
 import time
 from pathlib import Path
 from aiogram import Router, F, Bot
@@ -791,14 +793,13 @@ async def session_status_refresh(call: CallbackQuery):
     await session_status(call)
 
 # === НАСТРОЙКИ ===
-
 @settings_router.callback_query(F.data == 'settings')
 async def settings_menu(call: CallbackQuery):
-    """Меню настроек"""
+    """Меню настроек с информацией о живых настройках"""
     try:
         # Читаем текущие настройки
         settings = {
-            'view_period': read_setting('followPeriod.txt', 10.0),
+            'view_period': read_setting('followPeriod.txt', 1.0),
             'view_delay': read_setting('delay.txt', 20.0),
             'sub_lag': read_setting('lag.txt', 30.0),
             'sub_range': read_setting('range.txt', 5.0),
@@ -815,31 +816,80 @@ async def settings_menu(call: CallbackQuery):
             [IKB(text='⏳ ЗАДЕРЖКА АККАУНТОВ', callback_data='set:accounts_delay.txt')],
             [IKB(text='🔢 ПОДПИСОК ДО ПАУЗЫ', callback_data='set:timeout_count.txt')],
             [IKB(text='⏸️ ДЛИТЕЛЬНОСТЬ ПАУЗЫ', callback_data='set:timeout_duration.txt')],
+            [IKB(text='🔄 ОБНОВИТЬ ВСЕ', callback_data='force_settings_reload')],  # ✅ НОВАЯ КНОПКА
             [IKB(text='🔙 НАЗАД', callback_data='main_menu')]
         ])
         
         text = f"""<b>⚙️ НАСТРОЙКИ СИСТЕМЫ</b>
 
 <b>👀 ПРОСМОТРЫ:</b>
-⏰ Период: {settings['view_period']} час
+⏰ Период: {settings['view_period']} час ✅ ЖИВАЯ
 🔄 Задержка: {settings['view_delay']} мин
 
 <b>📺 ПОДПИСКИ:</b>
 📅 Основная задержка: {settings['sub_lag']} мин
 🎲 Разброс: {settings['sub_range']} мин
-⏳ Между аккаунтами: {settings['accounts_delay']} мин
+⏳ Между аккаунтами: {settings['accounts_delay']} мин ✅ ЖИВАЯ
 🔢 Подписок до паузы: {settings['timeout_count']}
-⏸️ Длительность паузы: {settings['timeout_duration']} мин"""
+⏸️ Длительность паузы: {settings['timeout_duration']} мин ✅ ЖИВАЯ
+
+💡 <i>Настройки с ✅ применяются сразу к новым задачам
+Остальные - только для новых каналов/постов</i>"""
         
-        await call.message.edit_text(
-            text,
+        await call.message.edit_text(text, parse_mode='HTML', reply_markup=keyboard)
+        
+    except Exception as e:
+        logger.error(f"Ошибка меню настроек: {e}")
+        await call.answer("❌ Произошла ошибка", show_alert=True)
+
+@settings_router.callback_query(F.data == 'force_settings_reload')
+async def force_settings_reload(call: CallbackQuery):
+    """Принудительное обновление настроек в воркере"""
+    try:
+        progress_msg = await call.message.edit_text(
+            "🔄 <b>Обновление настроек...</b>\n⏳ Отправляю сигнал воркеру...",
+            parse_mode='HTML'
+        )
+        
+        # Отправляем сигнал воркеру через Redis
+        from redis import Redis
+        from config import REDIS_HOST, REDIS_PORT, REDIS_PASSWORD
+        
+        redis_client = Redis(
+            host=REDIS_HOST,
+            port=REDIS_PORT,
+            password=REDIS_PASSWORD,
+            decode_responses=True
+        )
+        
+        # Отправляем команду воркеру
+        redis_client.lpush('worker_commands', json.dumps({
+            'command': 'reload_settings',
+            'timestamp': time.time()
+        }))
+        
+        keyboard = IKM(inline_keyboard=[
+            [IKB(text='🔙 К НАСТРОЙКАМ', callback_data='settings')]
+        ])
+        
+        await progress_msg.edit_text(
+            "✅ <b>Настройки обновлены!</b>\n\n"
+            "🔄 Воркер получил сигнал обновления\n"
+            "📊 Новые настройки применятся к следующим задачам\n\n"
+            "🟢 <b>Живые настройки:</b>\n"
+            "• Период просмотров (для новых постов)\n"
+            "• Задержка между аккаунтами\n"
+            "• Длительность пауз\n\n"
+            "🟡 <b>Для новых каналов:</b>\n"
+            "• Основная задержка подписок\n"
+            "• Разброс подписок",
             parse_mode='HTML',
             reply_markup=keyboard
         )
         
     except Exception as e:
-        logger.error(f"Ошибка меню настроек: {e}")
-        await call.answer("❌ Произошла ошибка", show_alert=True)
+        logger.error(f"Ошибка обновления настроек: {e}")
+        await call.answer("❌ Ошибка обновления", show_alert=True)
 
 @settings_router.callback_query(F.data.startswith('set:'))
 async def setting_change_start(call: CallbackQuery, state: FSMContext):

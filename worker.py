@@ -31,9 +31,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger('worker')
 
-class TaskWorker:
-    """Воркер для обработки задач просмотров и подписок"""
-    
+class ShardedTaskWorker:
     def __init__(self):
         self.redis_client = None
         self.running = False
@@ -41,8 +39,12 @@ class TaskWorker:
         self.sessions_loaded = False
         self.ban_retry_hours = 120  # 120 часов между попытками для забаненных
         
+        # ✅ НАСТРОЙКИ ШАРДИНГА
+        self.max_shards_per_cycle = 10  # Максимум шардов для проверки за раз
+        self.max_tasks_per_shard = 50   # Максимум задач с одного шарда
+        self.performance_mode = 'adaptive' 
+        
     async def start(self):
-        """Запуск воркера"""
         logger.info("🚀 Запуск Task Worker...")
         
         try:
@@ -59,11 +61,14 @@ class TaskWorker:
             )
             logger.info("✅ Redis подключен")
             
-            # Пытаемся загрузить сессии, но НЕ останавливаемся при их отсутствии
+            # Определяем режим производительности на основе нагрузки
+            await self._detect_performance_mode()
+            
+            # Пытаемся загрузить сессии
             logger.info("🧠 Попытка предзагрузки сессий...")
             await self._try_preload_sessions()
             
-            # Запуск основного цикла (работает даже без сессий)
+            # Запуск основного цикла
             self.running = True
             await self._main_loop()
             
@@ -73,8 +78,45 @@ class TaskWorker:
         finally:
             await self._shutdown()
     
+    async def _detect_performance_mode(self):
+        """Определяет оптимальный режим производительности на основе нагрузки"""
+        try:
+            # Анализируем количество активных шардов
+            view_shards = self.redis_client.zcard("active_view_shards") or 0
+            sub_shards = self.redis_client.zcard("active_subscription_shards") or 0
+            total_shards = view_shards + sub_shards
+            
+            # Адаптивная настройка режима
+            if total_shards <= 5:
+                self.performance_mode = 'conservative'
+                self.max_shards_per_cycle = 5
+                self.max_tasks_per_shard = 30
+                mode_desc = "КОНСЕРВАТИВНЫЙ (малая нагрузка)"
+            elif total_shards <= 20:
+                self.performance_mode = 'adaptive'  
+                self.max_shards_per_cycle = 10
+                self.max_tasks_per_shard = 50
+                mode_desc = "АДАПТИВНЫЙ (средняя нагрузка)"
+            else:
+                self.performance_mode = 'aggressive'
+                self.max_shards_per_cycle = 15
+                self.max_tasks_per_shard = 70
+                mode_desc = "АГРЕССИВНЫЙ (высокая нагрузка)"
+            
+            logger.info(f"""
+🎯 Режим производительности: {mode_desc}
+   🗂️ Всего активных шардов: {total_shards}
+   📊 Шардов за цикл: {self.max_shards_per_cycle}
+   📋 Задач с шарда: {self.max_tasks_per_shard}
+            """)
+            
+        except Exception as e:
+            logger.error(f"Ошибка определения режима производительности: {e}")
+            # Fallback на консервативный режим
+            self.performance_mode = 'conservative'
+    
     async def _try_preload_sessions(self):
-        """Пытается загрузить сессии, но не останавливает воркер при их отсутствии"""
+        """Пытается загрузить сессии"""
         try:
             results = await global_session_manager.preload_all_sessions()
             
@@ -92,18 +134,29 @@ class TaskWorker:
             self.sessions_loaded = False
     
     async def _main_loop(self):
-        """Основной цикл обработки задач с проверкой забаненных аккаунтов"""
-        logger.info("🔄 Запуск основного цикла обработки задач")
+        """Оптимизированный главный цикл с ШАРДИНГОМ"""
+        logger.info("🔄 Запуск цикла обработки задач")
         
         # Счетчики для статистики
         processed_views = 0
         processed_subs = 0
+        processed_shards = 0
         last_stats_time = time.time()
         last_session_check = time.time()
         last_ban_check = time.time()
+        last_cleanup = time.time()
+        last_performance_check = time.time()
         
         while self.running:
             try:
+                # Проверяем команды от бота
+                await self._process_worker_commands()
+                
+                # Проверяем и адаптируем режим производительности каждые 15 минут
+                if time.time() - last_performance_check > 900:
+                    await self._detect_performance_mode()
+                    last_performance_check = time.time()
+                
                 # Если сессии не загружены, пытаемся загрузить каждые 5 минут
                 if not self.sessions_loaded and time.time() - last_session_check > 300:
                     logger.info("🔍 Проверяю появление новых аккаунтов...")
@@ -115,47 +168,83 @@ class TaskWorker:
                     await self._check_banned_accounts_for_retry()
                     last_ban_check = time.time()
                 
+            
+                if time.time() - last_cleanup > 1800:
+                    await self._cleanup_expired_shards()
+                    last_cleanup = time.time()
+                
                 # Если сессии загружены, обрабатываем задачи
                 if self.sessions_loaded:
-                    # Обрабатываем отложенные просмотры
-                    view_tasks = await self._get_ready_view_tasks()
-                    if view_tasks:
-                        await self._process_view_batch(view_tasks)
-                        processed_views += len(view_tasks)
                     
-                    # Обрабатываем подписки
-                    sub_tasks = await self._get_ready_subscription_tasks()
+                    # ✅ ПОЛУЧАЕМ ГОТОВЫЕ ЗАДАЧИ 
+                    ready_tasks = await self._get_ready_tasks_from_shards()
+                    view_tasks = ready_tasks['view_tasks']
+                    sub_tasks = ready_tasks['subscription_tasks']
+                    processed_shards += ready_tasks['shards_processed']
+                    
+                    # ✅ ПАРАЛЛЕЛЬНО обрабатываем разные типы задач
+                    processing_tasks = []
+                    
+                    if view_tasks:
+                        processing_tasks.append(
+                            asyncio.create_task(
+                                self._process_view_batch_optimized(view_tasks),
+                                name="process_views"
+                            )
+                        )
+                    
                     if sub_tasks:
-                        await self._process_subscription_batch(sub_tasks)
-                        processed_subs += len(sub_tasks)
+                        processing_tasks.append(
+                            asyncio.create_task(
+                                self._process_subscription_batch_sequential(sub_tasks),
+                                name="process_subscriptions"
+                            )
+                        )
                     
                     # Обрабатываем retry задачи
-                    await self._process_retry_tasks()
+                    processing_tasks.append(
+                        asyncio.create_task(
+                            self._process_retry_tasks(),
+                            name="process_retry"
+                        )
+                    )
                     
-                    # Health check сессий каждые 15 минут
-                    if random.random() < 0.01:  # ~1% шанс = примерно раз в 15 минут
+                    # Ждем завершения всех задач
+                    if processing_tasks:
+                        results = await asyncio.gather(*processing_tasks, return_exceptions=True)
+                        
+                        # Подсчитываем результаты
+                        for i, result in enumerate(results):
+                            if isinstance(result, int):
+                                if processing_tasks[i].get_name() == "process_views":
+                                    processed_views += result
+                                elif processing_tasks[i].get_name() == "process_subscriptions":
+                                    processed_subs += result
+                            elif isinstance(result, Exception):
+                                logger.error(f"Ошибка в задаче {processing_tasks[i].get_name()}: {result}")
+                    
+                    # Health check сессий
+                    if random.random() < 0.005:  # ~0.5% шанс
                         health_stats = await global_session_manager.health_check()
                         if health_stats.get('removed_dead', 0) > 0:
                             logger.info(f"🔧 Очищено {health_stats['removed_dead']} мертвых сессий")
                 
                 # Статистика каждые 5 минут
                 if time.time() - last_stats_time > 300:
-                    if self.sessions_loaded:
-                        session_stats = await global_session_manager.get_stats()
-                        logger.info(f"""
-📊 Статистика за 5 минут:
-   👀 Просмотров: {processed_views}
-   📺 Подписок: {processed_subs}
-   🧠 Сессий активно: {session_stats['connected']}/{session_stats['total_loaded']}
-                        """)
-                    else:
-                        logger.info("⏳ Воркер активен, ожидаю загрузки аккаунтов...")
-                    
-                    processed_views = processed_subs = 0
+                    await self._log_performance_stats(processed_views, processed_subs, processed_shards)
+                    processed_views = processed_subs = processed_shards = 0
                     last_stats_time = time.time()
                 
-                # Пауза между циклами (больше если нет сессий)
-                sleep_time = 5 if self.sessions_loaded else 30
+                # Адаптивная пауза в зависимости от режима
+                sleep_time = {
+                    'conservative': 3,
+                    'adaptive': 2, 
+                    'aggressive': 1
+                }.get(self.performance_mode, 2)
+                
+                if not self.sessions_loaded:
+                    sleep_time *= 10  # Больше пауза если нет сессий
+                
                 await asyncio.sleep(sleep_time)
                 
             except KeyboardInterrupt:
@@ -163,8 +252,394 @@ class TaskWorker:
                 self.running = False
                 break
             except Exception as e:
-                logger.error(f"❌ Ошибка в основном цикле: {e}")
-                await asyncio.sleep(10)  # Пауза при ошибке
+                logger.error(f"❌ Ошибка в главном цикле: {e}")
+                await asyncio.sleep(5)
+    
+    async def _get_ready_tasks_from_shards(self) -> Dict[str, List[Dict]]:
+        """Получает готовые задачи из АКТИВНЫХ шардов"""
+        if not self.sessions_loaded:
+            return {'view_tasks': [], 'subscription_tasks': [], 'shards_processed': 0}
+            
+        try:
+            current_time = time.time()
+            view_tasks = []
+            subscription_tasks = []
+            shards_processed = 0
+            
+            # ✅ ПОЛУЧАЕМ АКТИВНЫЕ ШАРДЫ ПРОСМОТРОВ
+            view_shards_processed = await self._process_view_shards(current_time)
+            view_tasks.extend(view_shards_processed['tasks'])
+            shards_processed += view_shards_processed['shards_count']
+            
+            # ✅ ПОЛУЧАЕМ АКТИВНЫЕ ШАРДЫ ПОДПИСОК
+            sub_shards_processed = await self._process_subscription_shards(current_time)
+            subscription_tasks.extend(sub_shards_processed['tasks'])
+            shards_processed += sub_shards_processed['shards_count']
+            
+            if view_tasks or subscription_tasks:
+                logger.info(f"""
+✅ Из {shards_processed} шардов получено:
+   👀 Просмотров: {len(view_tasks)}
+   📺 Подписок: {len(subscription_tasks)}
+                """)
+            
+            return {
+                'view_tasks': view_tasks,
+                'subscription_tasks': subscription_tasks,
+                'shards_processed': shards_processed
+            }
+            
+        except Exception as e:
+            logger.error(f"Ошибка получения задач из шардов: {e}")
+            return {'view_tasks': [], 'subscription_tasks': [], 'shards_processed': 0}
+    
+    async def _process_view_shards(self, current_time: float) -> Dict:
+        """Обрабатывает активные шарды просмотров"""
+        try:
+            # Получаем готовые к обработке шарды просмотров
+            ready_view_shards = self.redis_client.zrangebyscore(
+                "active_view_shards",
+                min=0,
+                max=current_time + 1800,  # +30 минут вперед
+                withscores=False,
+                start=0,
+                num=self.max_shards_per_cycle
+            )
+            
+            view_tasks = []
+            processed_shards = 0
+            
+            for shard_meta_json in ready_view_shards:
+                try:
+                    shard_meta = json.loads(shard_meta_json)
+                    shard_key = shard_meta['shard_key']
+                    
+                    # Получаем готовые задачи из этого шарда
+                    ready_task_data = self.redis_client.zrangebyscore(
+                        shard_key,
+                        min=0,
+                        max=current_time,
+                        withscores=True,
+                        start=0,
+                        num=self.max_tasks_per_shard
+                    )
+                    
+                    if not ready_task_data:
+                        continue
+                    
+                    processed_tasks = []
+                    
+                    for task_json, score in ready_task_data:
+                        try:
+                            task_data = json.loads(task_json)
+                            
+                            # Добавляем задачи просмотра
+                            view_tasks.extend(task_data.get('tasks', []))
+                            processed_tasks.append(task_json)
+                            
+                        except Exception as e:
+                            logger.error(f"Ошибка задачи в шарде {shard_key}: {e}")
+                            processed_tasks.append(task_json)
+                    
+                    # Удаляем обработанные задачи из шарда
+                    if processed_tasks:
+                        self.redis_client.zrem(shard_key, *processed_tasks)
+                        processed_shards += 1
+                    
+                    # Если шард пустой - удаляем его из активных
+                    remaining = self.redis_client.zcard(shard_key)
+                    if remaining == 0:
+                        self.redis_client.zrem("active_view_shards", shard_meta_json)
+                        self.redis_client.delete(shard_key)
+                        logger.debug(f"🗑️ Пустой шард просмотров удален: {shard_key}")
+                    
+                except Exception as e:
+                    logger.error(f"Ошибка обработки шарда просмотров: {e}")
+            
+            return {
+                'tasks': view_tasks,
+                'shards_count': processed_shards
+            }
+            
+        except Exception as e:
+            logger.error(f"Ошибка обработки шардов просмотров: {e}")
+            return {'tasks': [], 'shards_count': 0}
+    
+    async def _process_subscription_shards(self, current_time: float) -> Dict:
+        """Обрабатывает активные шарды подписок"""
+        try:
+            # Получаем готовые к обработке шарды подписок
+            ready_sub_shards = self.redis_client.zrangebyscore(
+                "active_subscription_shards",
+                min=0,
+                max=current_time + 3600,  # +1 час вперед
+                withscores=False,
+                start=0,
+                num=self.max_shards_per_cycle
+            )
+            
+            subscription_tasks = []
+            processed_shards = 0
+            
+            for shard_meta_json in ready_sub_shards:
+                try:
+                    shard_meta = json.loads(shard_meta_json)
+                    shard_key = shard_meta['shard_key']
+                    
+                    # Получаем готовые задачи из этого шарда
+                    ready_task_data = self.redis_client.zrangebyscore(
+                        shard_key,
+                        min=0,
+                        max=current_time,
+                        withscores=True,
+                        start=0,
+                        num=self.max_tasks_per_shard // 2  # Подписки берем меньше
+                    )
+                    
+                    if not ready_task_data:
+                        continue
+                    
+                    processed_tasks = []
+                    
+                    for task_json, score in ready_task_data:
+                        try:
+                            task_data = json.loads(task_json)
+                            
+                            # Добавляем задачи подписки
+                            subscription_tasks.append(task_data)
+                            processed_tasks.append(task_json)
+                            
+                        except Exception as e:
+                            logger.error(f"Ошибка задачи в шарде {shard_key}: {e}")
+                            processed_tasks.append(task_json)
+                    
+                    # Удаляем обработанные задачи из шарда
+                    if processed_tasks:
+                        self.redis_client.zrem(shard_key, *processed_tasks)
+                        processed_shards += 1
+                    
+                    # Если шард пустой - удаляем его из активных
+                    remaining = self.redis_client.zcard(shard_key)
+                    if remaining == 0:
+                        self.redis_client.zrem("active_subscription_shards", shard_meta_json)
+                        self.redis_client.delete(shard_key)
+                        logger.debug(f"🗑️ Пустой шард подписок удален: {shard_key}")
+                    
+                except Exception as e:
+                    logger.error(f"Ошибка обработки шарда подписок: {e}")
+            
+            return {
+                'tasks': subscription_tasks,
+                'shards_count': processed_shards
+            }
+            
+        except Exception as e:
+            logger.error(f"Ошибка обработки шардов подписок: {e}")
+            return {'tasks': [], 'shards_count': 0}
+    
+    async def _process_view_batch_optimized(self, tasks: List[Dict]) -> int:
+        """ОПТИМИЗИРОВАННАЯ обработка просмотров для шардированных задач"""
+        if not tasks:
+            return 0
+        
+        # Группируем по постам для параллельной обработки
+        posts_tasks = {}
+        for task in tasks:
+            post_id = task.get('post_id', 'unknown')
+            if post_id not in posts_tasks:
+                posts_tasks[post_id] = []
+            posts_tasks[post_id].append(task)
+        
+        logger.info(f"👀 ШАРДИРОВАННАЯ обработка {len(tasks)} просмотров с {len(posts_tasks)} постов")
+        
+        total_success = 0
+        
+        # ✅ СЕМАФОР для контроля нагрузки в зависимости от режима
+        max_concurrent = {
+            'conservative': 5,
+            'adaptive': 10,
+            'aggressive': 15
+        }.get(self.performance_mode, 10)
+        
+        semaphore = asyncio.Semaphore(max_concurrent)
+        
+        async def process_post_limited(post_id, post_tasks_list):
+            async with semaphore:
+                return await self._process_post_views_batched(post_id, post_tasks_list)
+        
+        # Создаем ограниченное количество задач
+        post_tasks = []
+        for post_id, post_tasks_list in posts_tasks.items():
+            task = asyncio.create_task(
+                process_post_limited(post_id, post_tasks_list),
+                name=f"post_{post_id}_sharded"
+            )
+            post_tasks.append(task)
+        
+        # Выполняем с контролем нагрузки
+        results = await asyncio.gather(*post_tasks, return_exceptions=True)
+        
+        for result in results:
+            if isinstance(result, int):
+                total_success += result
+            elif isinstance(result, Exception):
+                logger.error(f"Ошибка шардированной обработки просмотров: {result}")
+        
+        logger.info(f"✅ Шардированные просмотры: {total_success}/{len(tasks)} успешно")
+        return total_success
+    
+    async def _process_post_views_batched(self, post_id: int, tasks: List[Dict]) -> int:
+        """Обработка просмотров поста БАТЧАМИ для больших объемов"""
+        
+        # ✅ АДАПТИВНЫЙ размер батча в зависимости от режима
+        batch_size = {
+            'conservative': 15,
+            'adaptive': 25,
+            'aggressive': 35
+        }.get(self.performance_mode, 25)
+        
+        success_count = 0
+        
+        for i in range(0, len(tasks), batch_size):
+            batch = tasks[i:i + batch_size]
+            
+            # Параллельно обрабатываем батч
+            view_tasks = []
+            for task in batch:
+                delay = random.uniform(0.1, 2.0)
+                view_task = asyncio.create_task(
+                    self._execute_view_task_with_delay(task, delay),
+                    name=f"view_{task.get('phone', 'unknown')}"
+                )
+                view_tasks.append(view_task)
+            
+            # Ждем батч
+            results = await asyncio.gather(*view_tasks, return_exceptions=True)
+            
+            # Подсчитываем успешные в батче
+            batch_success = sum(1 for r in results if isinstance(r, bool) and r)
+            success_count += batch_success
+            
+            # Адаптивная задержка между батчами
+            if i + batch_size < len(tasks):
+                batch_delay = {
+                    'conservative': random.uniform(2, 4),
+                    'adaptive': random.uniform(1, 3),
+                    'aggressive': random.uniform(0.5, 2)
+                }.get(self.performance_mode, random.uniform(1, 3))
+                
+                await asyncio.sleep(batch_delay)
+        
+        logger.info(f"📊 Пост {post_id}: {success_count}/{len(tasks)} просмотров (батчами)")
+        return success_count
+    
+    async def _process_subscription_batch_sequential(self, tasks: List[Dict]) -> int:
+        """ПОСЛЕДОВАТЕЛЬНАЯ обработка подписок с адаптивными задержками"""
+        if not tasks:
+            return 0
+        
+        logger.info(f"📺 ШАРДИРОВАННАЯ обработка {len(tasks)} подписок")
+        
+        success_count = 0
+        
+        for idx, task in enumerate(tasks):
+            try:
+                success = await self._execute_subscription_task(task)
+                if success:
+                    success_count += 1
+                
+                # Адаптивная задержка между подписками
+                if idx < len(tasks) - 1:
+                    accounts_delay_minutes = read_setting('accounts_delay.txt', 6.0)
+                    
+                    # Коррекция задержки в зависимости от режима
+                    delay_multiplier = {
+                        'conservative': 1.2,
+                        'adaptive': 1.0,
+                        'aggressive': 0.8
+                    }.get(self.performance_mode, 1.0)
+                    
+                    delay_seconds = accounts_delay_minutes * 60 * delay_multiplier * random.uniform(0.9, 1.1)
+                    
+                    logger.info(f"⏳ Пауза {delay_seconds/60:.1f} мин до следующей подписки...")
+                    await asyncio.sleep(delay_seconds)
+                
+            except Exception as e:
+                logger.error(f"Ошибка обработки подписки: {e}")
+        
+        logger.info(f"✅ Шардированные подписки: {success_count}/{len(tasks)} успешно")
+        return success_count
+    
+    async def _cleanup_expired_shards(self):
+        """Очищает истекшие шарды для освобождения памяти"""
+        try:
+            # Импортируем cleanup из task_service
+            from task_service import task_service
+            cleanup_stats = await task_service.cleanup_expired_shards()
+            
+            if cleanup_stats['expired_view_shards'] > 0 or cleanup_stats['expired_subscription_shards'] > 0:
+                logger.info(f"🧹 Очищено шардов: {cleanup_stats['expired_view_shards']} просмотров, {cleanup_stats['expired_subscription_shards']} подписок")
+            
+        except Exception as e:
+            logger.error(f"Ошибка очистки истекших шардов: {e}")
+    
+    async def _log_performance_stats(self, processed_views: int, processed_subs: int, processed_shards: int):
+        """Логирует статистику производительности"""
+        try:
+            if self.sessions_loaded:
+                session_stats = await global_session_manager.get_stats()
+                
+                # Статистика шардов
+                view_shards = self.redis_client.zcard("active_view_shards") or 0
+                sub_shards = self.redis_client.zcard("active_subscription_shards") or 0
+                
+                # Расчет производительности
+                views_per_min = processed_views / 5 if processed_views > 0 else 0
+                subs_per_min = processed_subs / 5 if processed_subs > 0 else 0
+                shards_per_min = processed_shards / 5 if processed_shards > 0 else 0
+                
+                # Определение статуса производительности
+                if views_per_min > 10:
+                    performance_status = "🚀 ОТЛИЧНО"
+                elif views_per_min > 5:
+                    performance_status = "✅ ХОРОШО"
+                elif views_per_min > 1:
+                    performance_status = "⚠️ СРЕДНЕ"
+                else:
+                    performance_status = "❌ НИЗКО"
+                
+                logger.info(f"""
+📊 ШАРДИРОВАННАЯ СТАТИСТИКА (5 мин, режим: {self.performance_mode.upper()}):
+   👀 Просмотров: {processed_views} ({views_per_min:.1f}/мин)
+   📺 Подписок: {processed_subs} ({subs_per_min:.1f}/мин)
+   🗂️ Шардов обработано: {processed_shards} ({shards_per_min:.1f}/мин)
+   🧠 Сессий: {session_stats['connected']}/{session_stats['total_loaded']}
+   📋 Активных шардов: {view_shards} просмотров, {sub_shards} подписок
+   🚀 Производительность: {performance_status}
+                """)
+            else:
+                logger.info("⏳ Шардированный воркер активен, ожидаю загрузки аккаунтов...")
+                
+        except Exception as e:
+            logger.error(f"Ошибка логирования статистики: {e}")
+    
+    async def _process_worker_commands(self):
+        """Обрабатывает команды от бота"""
+        try:
+            command_data = self.redis_client.rpop('worker_commands')
+            if not command_data:
+                return
+                
+            command = json.loads(command_data)
+            
+            if command['command'] == 'reload_settings':
+                logger.info("🔄 Получена команда обновления настроек")
+                # Перенастраиваем режим производительности
+                await self._detect_performance_mode()
+                logger.info("✅ Настройки обновлены, режим производительности пересчитан")
+                
+        except Exception as e:
+            logger.error(f"Ошибка обработки команд: {e}")
     
     async def _check_banned_accounts_for_retry(self):
         """Проверяет забаненные аккаунты раз в 120 часов"""
@@ -187,7 +662,7 @@ class TaskWorker:
                     test_task = {
                         'account_session': account['session_data'],
                         'phone': phone,
-                        'channel': 'telegram',  # Простой канал для теста
+                        'channel': 'telegram',
                         'lang': account['lang']
                     }
                     
@@ -208,138 +683,12 @@ class TaskWorker:
         except Exception as e:
             logger.error(f"Ошибка проверки забаненных аккаунтов: {e}")
     
-    async def _get_ready_view_tasks(self) -> List[Dict]:
-        """Получает готовые к выполнению задачи просмотра"""
-        if not self.sessions_loaded:
-            return []
-            
-        try:
-            current_time = time.time()
-            ready_tasks = []
-            
-            # Получаем батчи из очереди
-            while True:
-                batch_data = self.redis_client.rpop('delayed_view_batches')
-                if not batch_data:
-                    break
-                
-                try:
-                    batch = json.loads(batch_data)
-                    
-                    # Проверяем время выполнения
-                    if batch['execute_at'] <= current_time:
-                        # Время пришло - добавляем задачи
-                        ready_tasks.extend(batch['tasks'])
-                        logger.debug(f"⏰ Батч #{batch['batch_number']} готов: {len(batch['tasks'])} задач")
-                    else:
-                        # Время еще не пришло - возвращаем в очередь
-                        self.redis_client.lpush('delayed_view_batches', batch_data)
-                        break
-                        
-                except Exception as e:
-                    logger.error(f"Ошибка парсинга батча: {e}")
-                    continue
-            
-            return ready_tasks[:1000]  # Максимум 1000 задач за раз
-            
-        except Exception as e:
-            logger.error(f"Ошибка получения задач просмотра: {e}")
-            return []
-    
-    async def _get_ready_subscription_tasks(self) -> List[Dict]:
-        """Получает готовые к выполнению задачи подписки С ПРОВЕРКОЙ ВРЕМЕНИ"""
-        if not self.sessions_loaded:
-            return []
-            
-        try:
-            current_time = time.time()
-            ready_tasks = []
-            checked_tasks = 0
-            max_checks = 200  # Максимум задач для проверки за раз
-            
-            # Получаем задачи из очереди и проверяем время
-            temp_storage = []  # Временное хранение "не готовых" задач
-            
-            while checked_tasks < max_checks:
-                task_data = self.redis_client.rpop('subscription_tasks')
-                if not task_data:
-                    break
-                
-                checked_tasks += 1
-                
-                try:
-                    task = json.loads(task_data)
-                    
-                    # Проверяем время выполнения
-                    execute_at = task.get('execute_at', 0)
-                    
-                    if execute_at <= current_time:
-                        # Время пришло - добавляем к готовым
-                        ready_tasks.append(task)
-                        phone = task.get('phone', 'unknown')
-                        delay_was = (current_time - task.get('created_at', current_time)) / 60
-                        logger.info(f"⏰ Подписка готова: @{phone} (ждала {delay_was:.1f} мин)")
-                    else:
-                        # Время еще не пришло - сохраняем для возврата
-                        temp_storage.append(task_data)
-                        
-                except Exception as e:
-                    logger.error(f"Ошибка парсинга задачи подписки: {e}")
-                    continue
-            
-            # Возвращаем "не готовые" задачи обратно в очередь
-            for task_data in temp_storage:
-                self.redis_client.lpush('subscription_tasks', task_data)
-            
-            if ready_tasks:
-                logger.info(f"📺 Готово {len(ready_tasks)} подписок из {checked_tasks} проверенных")
-            
-            return ready_tasks[:50]  # Максимум 50 подписок за раз
-            
-        except Exception as e:
-            logger.error(f"Ошибка получения задач подписки: {e}")
-            return []
-    
-    async def _process_view_batch(self, tasks: List[Dict]):
-        """Обрабатывает батч задач просмотра (теперь обычно 1 задача)"""
-        if not tasks:
-            return
+    async def _execute_view_task_with_delay(self, task: Dict, delay: float = 0) -> bool:
+        """Выполняет просмотр с задержкой"""
+        if delay > 0:
+            await asyncio.sleep(delay)
         
-        task_count = len(tasks)
-        
-        if task_count == 1:
-            # Одиночная задача (обычный случай)
-            task = tasks[0]
-            phone = task.get('phone', 'unknown')
-            logger.info(f"👀 Обрабатываю просмотр для @{phone}")
-            
-            success = await self._execute_view_task(task)
-            if success:
-                logger.info(f"✅ @{phone}: просмотр выполнен успешно")
-            else:
-                logger.warning(f"❌ @{phone}: просмотр не выполнен")
-                
-        else:
-            # Множественные задачи (старый формат батчей)
-            logger.info(f"👀 Обрабатываю {task_count} задач просмотра")
-            
-            success_count = 0
-            for idx, task in enumerate(tasks):
-                try:
-                    result = await self._execute_view_task(task)
-                    if result:
-                        success_count += 1
-                    
-                    # Задержка между задачами в батче (если их несколько)
-                    if idx < len(tasks) - 1:
-                        delay = random.uniform(30, 60)
-                        logger.info(f"⏳ Пауза {delay:.1f}с между задачами в батче...")
-                        await asyncio.sleep(delay)
-                        
-                except Exception as e:
-                    logger.error(f"Ошибка обработки просмотра: {e}")
-            
-            logger.info(f"✅ Просмотры в батче: {success_count}/{task_count} успешно")
+        return await self._execute_view_task(task)
     
     async def _execute_view_task(self, task: Dict) -> bool:
         """Выполняет одну задачу просмотра с обработкой банов"""
@@ -357,10 +706,10 @@ class TaskWorker:
                 await self._handle_task_failure(phone, 'view')
                 return False
             
-            # Добавляем небольшую случайную задержку внутри батча
+            # Добавляем небольшую случайную задержку
             await asyncio.sleep(random.uniform(0.1, 2.0))
             
-            # Получаем entity канала (можно кэшировать)
+            # Получаем entity канала
             try:
                 channel_entity = await client.get_entity(channel)
             except Exception as e:
@@ -385,7 +734,6 @@ class TaskWorker:
             
         except FloodWaitError as e:
             logger.warning(f"⏳ {phone}: FloodWait {e.seconds}s")
-            # Добавляем в retry с задержкой
             await self._add_to_retry_queue(task, 'view', delay=e.seconds)
             return False
             
@@ -398,44 +746,6 @@ class TaskWorker:
             logger.error(f"💥 {phone}: неожиданная ошибка - {e}")
             await self._handle_task_failure(phone, 'view')
             return False
-    
-    async def _process_subscription_batch(self, tasks: List[Dict]):
-        """Обрабатывает батч задач подписки с ДОПОЛНИТЕЛЬНЫМИ задержками"""
-        if not tasks:
-            return
-        
-        logger.info(f"📺 Обрабатываю {len(tasks)} задач подписки")
-        
-        success_count = 0
-        
-        for idx, task in enumerate(tasks):
-            try:
-                success = await self._execute_subscription_task(task)
-                if success:
-                    success_count += 1
-                
-                # УВЕЛИЧЕННЫЕ задержки между подписками в батче
-                if idx < len(tasks) - 1:  # Не ждем после последней
-                    # Читаем актуальную задержку между аккаунтами
-                    accounts_delay_minutes = read_setting('accounts_delay.txt', 10.0)
-                    
-                    # Применяем задержку с рандомизацией
-                    delay = accounts_delay_minutes * 60 * random.uniform(0.8, 1.2)
-                    
-                    logger.info(f"⏳ Пауза {delay/60:.1f} мин перед следующей подпиской...")
-                    await asyncio.sleep(delay)
-                
-            except Exception as e:
-                logger.error(f"Ошибка обработки подписки: {e}")
-        
-        logger.info(f"✅ Подписки в батче: {success_count}/{len(tasks)} успешно")
-        
-        # Дополнительная пауза после батча (читаем из настроек)
-        batch_pause_minutes = read_setting('timeout_duration.txt', 20.0)
-        batch_pause = batch_pause_minutes * 60
-        
-        logger.info(f"⏳ Пауза {batch_pause_minutes} мин после батча подписок...")
-        await asyncio.sleep(batch_pause)
     
     async def _execute_subscription_task(self, task: Dict) -> bool:
         """Выполняет одну задачу подписки с обработкой банов"""
@@ -488,7 +798,7 @@ class TaskWorker:
         try:
             success = await reset_account_fails(phone)
             if success:
-                logger.info(f"🔓 {phone}: восстановлен в active (счетчик неудач сброшен)")
+                logger.debug(f"🔓 {phone}: восстановлен в active")
         except Exception as e:
             logger.error(f"Ошибка обработки успеха для {phone}: {e}")
 
@@ -498,14 +808,11 @@ class TaskWorker:
             fail_count = await increment_account_fails(phone)
             
             if fail_count >= 3:
-                # Переводим в бан после 3 неудач
                 await update_account_status(phone, 'ban')
                 logger.warning(f"🚫 {phone}: переведен в BAN (неудач: {fail_count})")
-                
-                # Удаляем из пула сессий
                 await global_session_manager.remove_session_by_phone(phone)
             else:
-                logger.info(f"⚠️ {phone}: неудача {fail_count}/3 ({task_type})")
+                logger.debug(f"⚠️ {phone}: неудача {fail_count}/3 ({task_type})")
                 
         except Exception as e:
             logger.error(f"Ошибка обработки неудачи для {phone}: {e}")
@@ -515,7 +822,7 @@ class TaskWorker:
         try:
             task['retry_count'] = task.get('retry_count', 0) + 1
             task['task_type'] = task_type
-            task['retry_after'] = time.time() + delay + random.uniform(60, 300)  # Дополнительная задержка
+            task['retry_after'] = time.time() + delay + random.uniform(60, 300)
             
             if task['retry_count'] <= self.max_retries:
                 self.redis_client.lpush('retry_tasks', json.dumps(task))
@@ -531,7 +838,14 @@ class TaskWorker:
         try:
             current_time = time.time()
             
-            for _ in range(50):  # Максимум 50 retry задач за раз
+            # Адаптивное количество retry задач в зависимости от режима
+            max_retry = {
+                'conservative': 20,
+                'adaptive': 50,
+                'aggressive': 80
+            }.get(self.performance_mode, 50)
+            
+            for _ in range(max_retry):
                 task_data = self.redis_client.rpop('retry_tasks')
                 if not task_data:
                     break
@@ -559,13 +873,10 @@ class TaskWorker:
             logger.error(f"Ошибка обработки retry очереди: {e}")
     
     async def reload_sessions(self) -> bool:
-        """Принудительная перезагрузка сессий (для вызова из бота)"""
+        """Принудительная перезагрузка сессий"""
         logger.info("🔄 Принудительная перезагрузка сессий...")
         try:
-            # Закрываем старые сессии
             await global_session_manager.shutdown()
-            
-            # Загружаем новые
             await self._try_preload_sessions()
             
             if self.sessions_loaded:
@@ -581,12 +892,12 @@ class TaskWorker:
     
     async def stop(self):
         """Остановка воркера"""
-        logger.info("⏹️ Остановка воркера...")
+        logger.info("⏹️ Остановка шардированного воркера...")
         self.running = False
     
     async def _shutdown(self):
         """Корректное завершение работы"""
-        logger.info("🔄 Завершение работы воркера...")
+        logger.info("🔄 Завершение работы шардированного воркера...")
         
         try:
             # Закрываем все сессии
@@ -596,18 +907,15 @@ class TaskWorker:
             if self.redis_client:
                 self.redis_client.close()
             
-            # НЕ ЗАКРЫВАЕМ пул БД - он нужен для бота!
-            # await shutdown_db_pool()  # <-- Убираем эту строку
-            
-            logger.info("✅ Воркер корректно завершен (БД остается активная)")
+            logger.info("✅ Шардированный воркер корректно завершен")
             
         except Exception as e:
             logger.error(f"Ошибка при завершении: {e}")
 
 # Запуск воркера
 async def main():
-    """Главная функция воркера"""
-    worker = TaskWorker()
+    """Главная функция шардированного воркера"""
+    worker = ShardedTaskWorker()
     
     try:
         await worker.start()
@@ -627,5 +935,5 @@ if __name__ == "__main__":
     except ImportError:
         logger.info("⚠️ uvloop недоступен, используем стандартный event loop")
     
-    # Запускаем воркер
+    # Запускаем шардированный воркер
     asyncio.run(main())
