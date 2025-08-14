@@ -34,16 +34,11 @@ class TaskItem:
     retry_count: int = 0
 
 class ShardedTaskService:
-    """
-    МАСШТАБИРУЕМЫЙ сервис для управления задачами с ШАРДИНГОМ
-    Оптимизирован для больших нагрузок (1500+ аккаунтов)
-    """
-    
+
     def __init__(self):
         self.batch_size = BATCH_SIZE
-        # ✅ НАСТРОЙКИ ШАРДИНГА
-        self.view_shard_interval = 30 * 60  # 30 минут на шард (просмотры)
-        self.subscription_shard_interval = 60 * 60  # 60 минут на шард (подписки)
+        self.view_shard_interval = 15 * 60  
+        self.subscription_shard_interval = 60 * 60 
         
     def get_view_duration(self) -> int:
         """Получает актуальную длительность просмотров из настроек"""
@@ -141,11 +136,9 @@ class ShardedTaskService:
             logger.error(f"Ошибка получения языков канала: {e}")
             return []
     
+    # В task_service.py замените метод _create_sharded_view_batches:
+
     async def _create_sharded_view_batches(self, all_tasks: List[TaskItem], post_id: int, duration_seconds: int) -> tuple[List[Dict], int]:
-        """
-        МАСШТАБИРУЕМОЕ создание батчей с ШАРДИНГОМ по времени
-        """
-        
         if not all_tasks:
             return [], 0
         
@@ -154,50 +147,43 @@ class ShardedTaskService:
         
         total_accounts = len(all_tasks)
         
-        logger.info(f"📊 Пост {post_id}: ШАРДИНГ {total_accounts} аккаунтов на {duration_seconds/3600:.1f} часов")
+        logger.info(f"📊 Пост {post_id}: ТОЧНОЕ распределение {total_accounts} аккаунтов на {duration_seconds/3600:.1f} часов")
         
-        # ✅ АДАПТИВНАЯ ОПТИМИЗАЦИЯ в зависимости от количества аккаунтов
-        if total_accounts <= 100:
-            # Малая нагрузка - сжимаем время
-            effective_duration = duration_seconds // 4  # 2.5 часа вместо 10
-            shard_interval = 15 * 60  # 15-минутные шарды
-            logger.info(f"🚀 Малая нагрузка - ускоряем до {effective_duration/3600:.1f} часов")
-        elif total_accounts <= 500:
-            # Средняя нагрузка
-            effective_duration = duration_seconds // 2  # 5 часов
-            shard_interval = 20 * 60  # 20-минутные шарды
-            logger.info(f"⚡ Средняя нагрузка - ускоряем до {effective_duration/3600:.1f} часов")
-        else:
-            # Большая нагрузка - используем полное время
-            effective_duration = duration_seconds
-            shard_interval = self.view_shard_interval  # 30-минутные шарды
-            logger.info(f"🏗️ Большая нагрузка - полное время {effective_duration/3600:.1f} часов")
-        
-        # Рассчитываем интервал между аккаунтами
+        # ✅ ТОЧНЫЙ расчет интервалов
         if total_accounts > 1:
-            interval_per_account = effective_duration / (total_accounts - 1)
+            # Распределяем равномерно по всему периоду
+            interval_per_account = duration_seconds / total_accounts
         else:
             interval_per_account = 0
         
-        # ✅ МИНИМАЛЬНЫЙ интервал для стабильности
-        interval_per_account = max(interval_per_account, 10)  # Минимум 10 секунд
+        interval_per_account = max(interval_per_account, 30)
         
-        logger.info(f"⏱️ Интервал между аккаунтами: {interval_per_account:.1f} секунд")
+        if interval_per_account > 300:  # Больше 5 минут
+            interval_per_account = 300
+            logger.info(f"⚡ Ускоряю интервал до 5 минут для эффективности")
         
-        # ✅ СОЗДАЕМ ЗАДАЧИ С ШАРДИНГОМ
+        logger.info(f"⏱️ Интервал между аккаунтами: {interval_per_account:.1f} секунд ({interval_per_account/60:.1f} мин)")
+        
+        # ✅ СОЗДАЕМ ЗАДАЧИ С ТОЧНЫМ ВРЕМЕНЕМ
         current_time = time.time()
         batches = []
-        shards_map = {}  # shard_id -> list of batches
+        shards_map = {}
         
         for idx, task in enumerate(all_tasks):
-            # Время выполнения для этого аккаунта  
+          
             execute_at = current_time + (idx * interval_per_account)
             
-            # Небольшая рандомизация (±30 сек)
-            randomization = random.uniform(-30, 30)
+            max_time = current_time + duration_seconds - 60  
+            if execute_at > max_time:
+                execute_at = max_time - (total_accounts - idx - 1) * 30  
+            
+            randomization_range = min(interval_per_account * 0.1, 30) 
+            randomization = random.uniform(-randomization_range, randomization_range)
             execute_at += randomization
             
-            # ✅ ОПРЕДЕЛЯЕМ ШАРД по времени выполнения
+            execute_at = max(execute_at, current_time + 30) 
+            execute_at = min(execute_at, current_time + duration_seconds - 30)  
+            shard_interval = 900 
             shard_id = int((execute_at - current_time) // shard_interval)
             
             # Устанавливаем время выполнения
@@ -220,19 +206,24 @@ class ShardedTaskService:
             
             batches.append(batch_info)
         
-        # ✅ ПЛАНИРУЕМ ШАРДИРОВАННЫЕ БАТЧИ
-        shards_count = len(shards_map)
-        await self._schedule_sharded_batches(shards_map, post_id, current_time, shard_interval)
+        # ✅ ПРОВЕРКА РАСПРЕДЕЛЕНИЯ
+        first_time = min(batch['execute_at'] for batch in batches)
+        last_time = max(batch['execute_at'] for batch in batches)
+        actual_duration = (last_time - first_time) / 3600
         
         logger.info(f"""
-✅ Пост {post_id}: создано {len(batches)} батчей в {shards_count} шардах
-   ⏰ Первый: сейчас  
-   ⏰ Последний: через {effective_duration/3600:.1f} ч
-   📊 Интервал: {interval_per_account:.1f} сек
-   🗂️ Шардов: {shards_count} × {shard_interval//60} мин
+    ✅ Пост {post_id}: создано {len(batches)} задач в {len(shards_map)} шардах
+    ⏰ Первый просмотр: через {(first_time - current_time)/60:.1f} мин
+    ⏰ Последний просмотр: через {(last_time - current_time)/60:.1f} мин  
+    📊 Фактический период: {actual_duration:.2f} часов
+    🎯 Целевой период: {duration_seconds/3600:.1f} часов
+    ✅ Точность: {abs(actual_duration - duration_seconds/3600) < 0.1}
         """)
         
-        return batches, shards_count
+
+        await self._schedule_sharded_batches(shards_map, post_id, current_time, shard_interval)
+        
+        return batches, len(shards_map)
     
     async def _schedule_sharded_batches(self, shards_map: Dict[int, List[Dict]], post_id: int, 
                                       base_time: float, shard_interval: int):
