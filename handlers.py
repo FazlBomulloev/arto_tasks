@@ -969,16 +969,36 @@ async def setting_change_process(message: Message, state: FSMContext):
 
 @stats_router.callback_query(F.data == 'statistics')
 async def statistics_menu(call: CallbackQuery):
-    """Меню статистики"""
+    """Меню статистики для простой системы"""
     try:
         # Статистика аккаунтов
         account_stats = await get_account_stats()
         
-        # Статистика задач
+        # Статистика задач из простой очереди
         task_stats = await task_service.get_task_stats()
         
         # Статистика сессий
         session_stats = await global_session_manager.get_stats()
+        
+        # Статистика буфера воркера (если доступна)
+        buffer_stats = {}
+        try:
+            # Пытаемся получить статистику буфера из Redis
+            from redis import Redis
+            from config import REDIS_HOST, REDIS_PORT, REDIS_PASSWORD
+            
+            redis_client = Redis(
+                host=REDIS_HOST,
+                port=REDIS_PORT,
+                password=REDIS_PASSWORD,
+                decode_responses=True
+            )
+            
+            # Можно добавить команду для получения статистики буфера
+            buffer_info = "Нет данных"
+            
+        except:
+            buffer_info = "Недоступно"
         
         keyboard = IKM(inline_keyboard=[
             [IKB(text='📊 ПО ЯЗЫКАМ', callback_data='stats_by_lang')],
@@ -999,10 +1019,14 @@ async def statistics_menu(call: CallbackQuery):
 🟢 Подключены: {session_stats['connected']}
 🔄 Статус: {'✅ Готов' if session_stats['loading_complete'] else '⏳ Загрузка'}
 
-<b>📋 ЗАДАЧИ:</b>
-👀 Просмотры в очереди: {task_stats.get('pending_view_batches', 0)}
-📺 Подписки в очереди: {task_stats.get('pending_subscriptions', 0)}
-🔄 Повторы: {task_stats.get('retry_queue', 0)}"""
+<b>📋 ЗАДАЧИ (Простая очередь):</b>
+📦 Всего в Redis: {task_stats.get('total_tasks', 0)}
+✅ Готовых к выполнению: {task_stats.get('ready_tasks', 0)}
+⏳ Будущих: {task_stats.get('future_tasks', 0)}
+🔄 Повторы: {task_stats.get('retry_tasks', 0)}
+
+<b>💾 БУФЕР ВОРКЕРА:</b>
+📊 Информация: {buffer_info}"""
         
         await call.message.edit_text(
             text,
