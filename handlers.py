@@ -43,7 +43,7 @@ from database import (
 )
 from session_manager import global_session_manager
 from account_service import account_service
-from task_service import task_service, TaskType
+from task_service import task_service
 from exceptions import AccountValidationError, TaskProcessingError
 
 logger = logging.getLogger(__name__)
@@ -293,9 +293,8 @@ async def add_channel_process(message: Message, state: FSMContext):
         await message.delete()
         
         if success:
-            # Создаем задачи подписки
+            # Создаем задачи подписки для ПРОСТОЙ СИСТЕМЫ
             try:
-                from task_service import task_service
                 results = await task_service.create_subscription_tasks(channel_name, lang)
                 
                 keyboard = IKM(inline_keyboard=[
@@ -306,7 +305,7 @@ async def add_channel_process(message: Message, state: FSMContext):
                     f"✅ <b>Канал @{channel_name} добавлен!</b>\n\n"
                     f"📊 Создано задач подписки: {results['total_tasks']}\n"
                     f"👥 Аккаунтов задействовано: {results['accounts_processed']}\n\n"
-                    f"🔄 Подписки выполняются в фоне с умными задержками",
+                    f"🔄 Подписки выполняются в фоне с умными задержками\n",
                     parse_mode='HTML',
                     reply_markup=keyboard
                 )
@@ -377,9 +376,7 @@ async def delete_channel_execute(call: CallbackQuery):
         logger.error(f"Ошибка удаления канала: {e}")
         await call.answer("❌ Произошла ошибка при удалении", show_alert=True)
 
-# === УПРАВЛЕНИЕ АККАУНТАМИ ===e}")
-        await call.answer("❌ Произошла ошибка при удалении", show_alert=True)
-        await call.answer("❌ Произошла ошибка при удалении", show_alert=True)
+# === УПРАВЛЕНИЕ АККАУНТАМИ ===
 
 @account_router.callback_query(F.data == 'accounts')
 async def accounts_menu(call: CallbackQuery):
@@ -472,13 +469,7 @@ async def add_accounts_process(message: Message, state: FSMContext):
             f"Архив: <b>{message.document.file_name}</b>\n\n"
             f"<b>Выберите режим обработки:</b>\n\n"
             f"✅ <b>С ПРОВЕРКОЙ</b> - медленно, но надежно:\n"
-            f"   • Каждый аккаунт проверяется на авторизацию\n"
-            f"   • Постепенное подключение (2 часа на 1000 акк)\n"
-            f"   • Неработающие аккаунты не добавляются\n\n"
-            f"⚡ <b>БЫСТРОЕ ДОБАВЛЕНИЕ</b> - мгновенно:\n"
-            f"   • Все аккаунты добавляются сразу в БД\n"
-            f"   • Проверка происходит при выполнении задач\n"
-            f"   • Неработающие помечаются как 'ban' потом",
+            f"⚡ <b>БЫСТРОЕ ДОБАВЛЕНИЕ</b> - мгновенно:\n",
             parse_mode='HTML',
             reply_markup=keyboard
         )
@@ -519,8 +510,8 @@ async def process_accounts_with_choice(call: CallbackQuery, state: FSMContext):
                 except:
                     pass
             
-            # Используем старый метод с валидацией
-            results = await account_service.add_accounts_from_zip_with_validation(
+            # Используем метод с валидацией
+            results = await account_service.add_accounts_from_zip(
                 zip_path, lang, update_progress
             )
             
@@ -538,7 +529,7 @@ async def process_accounts_with_choice(call: CallbackQuery, state: FSMContext):
                 except:
                     pass
             
-            # Используем новый метод без валидации
+            # Используем метод без валидации
             results = await account_service.add_accounts_from_zip_fast(
                 zip_path, lang, update_progress
             )
@@ -564,7 +555,8 @@ async def process_accounts_with_choice(call: CallbackQuery, state: FSMContext):
             f"⏭️ Уже было: {results.get('skipped_exists', 0)}\n"
             f"❌ Не удалось: {results.get('failed_validation', 0) + results.get('failed_db', 0)}\n"
             f"📈 Успешность: {success_rate:.1f}%\n\n"
-            f"{'🔍 Все аккаунты проверены и готовы' if validate else '⚡ Аккаунты добавлены, проверка при выполнении задач'}",
+            f"{'🔍 Все аккаунты проверены и готовы' if validate else '⚡ Аккаунты добавлены, проверка при выполнении задач'}\n"
+            f"📋 Задачи создаются в простой очереди task_queue",
             parse_mode='HTML',
             reply_markup=keyboard
         )
@@ -816,11 +808,11 @@ async def settings_menu(call: CallbackQuery):
             [IKB(text='⏳ ЗАДЕРЖКА АККАУНТОВ', callback_data='set:accounts_delay.txt')],
             [IKB(text='🔢 ПОДПИСОК ДО ПАУЗЫ', callback_data='set:timeout_count.txt')],
             [IKB(text='⏸️ ДЛИТЕЛЬНОСТЬ ПАУЗЫ', callback_data='set:timeout_duration.txt')],
-            [IKB(text='🔄 ОБНОВИТЬ ВСЕ', callback_data='force_settings_reload')],  # ✅ НОВАЯ КНОПКА
+            [IKB(text='🔄 ОБНОВИТЬ ВСЕ', callback_data='force_settings_reload')],
             [IKB(text='🔙 НАЗАД', callback_data='main_menu')]
         ])
         
-        text = f"""<b>⚙️ НАСТРОЙКИ СИСТЕМЫ</b>
+        text = f"""<b>⚙️ НАСТРОЙКИ ПРОСТОЙ СИСТЕМЫ</b>
 
 <b>👀 ПРОСМОТРЫ:</b>
 ⏰ Период: {settings['view_period']} час ✅ ЖИВАЯ
@@ -833,8 +825,8 @@ async def settings_menu(call: CallbackQuery):
 🔢 Подписок до паузы: {settings['timeout_count']}
 ⏸️ Длительность паузы: {settings['timeout_duration']} мин ✅ ЖИВАЯ
 
-💡 <i>Настройки с ✅ применяются сразу к новым задачам
-Остальные - только для новых каналов/постов</i>"""
+📋 <b>Очередь:</b> task_queue (простая система)
+💡 <i>Настройки с ✅ применяются сразу к новым задачам</i>"""
         
         await call.message.edit_text(text, parse_mode='HTML', reply_markup=keyboard)
         
@@ -876,13 +868,10 @@ async def force_settings_reload(call: CallbackQuery):
             "✅ <b>Настройки обновлены!</b>\n\n"
             "🔄 Воркер получил сигнал обновления\n"
             "📊 Новые настройки применятся к следующим задачам\n\n"
-            "🟢 <b>Живые настройки:</b>\n"
-            "• Период просмотров (для новых постов)\n"
-            "• Задержка между аккаунтами\n"
-            "• Длительность пауз\n\n"
-            "🟡 <b>Для новых каналов:</b>\n"
-            "• Основная задержка подписок\n"
-            "• Разброс подписок",
+            "📋 <b>Простая система:</b>\n"
+            "• Все задачи в одной очереди task_queue\n"
+            "• Воркер загружает до 3000 задач в память\n"
+            "• Настройки применяются мгновенно",
             parse_mode='HTML',
             reply_markup=keyboard
         )
@@ -953,7 +942,8 @@ async def setting_change_process(message: Message, state: FSMContext):
         await message.delete()
         await message.answer(
             f"✅ <b>Настройка обновлена</b>\n\n"
-            f"📝 {setting_name}: <b>{new_value}</b>",
+            f"📝 {setting_name}: <b>{new_value}</b>\n"
+            f"📋 Простая система: настройка применится к новым задачам",
             parse_mode='HTML',
             reply_markup=keyboard
         )
@@ -980,33 +970,13 @@ async def statistics_menu(call: CallbackQuery):
         # Статистика сессий
         session_stats = await global_session_manager.get_stats()
         
-        # Статистика буфера воркера (если доступна)
-        buffer_stats = {}
-        try:
-            # Пытаемся получить статистику буфера из Redis
-            from redis import Redis
-            from config import REDIS_HOST, REDIS_PORT, REDIS_PASSWORD
-            
-            redis_client = Redis(
-                host=REDIS_HOST,
-                port=REDIS_PORT,
-                password=REDIS_PASSWORD,
-                decode_responses=True
-            )
-            
-            # Можно добавить команду для получения статистики буфера
-            buffer_info = "Нет данных"
-            
-        except:
-            buffer_info = "Недоступно"
-        
         keyboard = IKM(inline_keyboard=[
             [IKB(text='📊 ПО ЯЗЫКАМ', callback_data='stats_by_lang')],
             [IKB(text='🔄 ОБНОВИТЬ', callback_data='statistics')],
             [IKB(text='🔙 НАЗАД', callback_data='main_menu')]
         ])
         
-        text = f"""<b>📊 ОБЩАЯ СТАТИСТИКА</b>
+        text = f"""<b>📊 СТАТИСТИКА</b>
 
 <b>👥 АККАУНТЫ:</b>
 📱 Всего: {account_stats.get('total', 0)}
@@ -1019,14 +989,14 @@ async def statistics_menu(call: CallbackQuery):
 🟢 Подключены: {session_stats['connected']}
 🔄 Статус: {'✅ Готов' if session_stats['loading_complete'] else '⏳ Загрузка'}
 
-<b>📋 ЗАДАЧИ (Простая очередь):</b>
+<b>📋 ЗАДАЧИ (task_queue):</b>
 📦 Всего в Redis: {task_stats.get('total_tasks', 0)}
 ✅ Готовых к выполнению: {task_stats.get('ready_tasks', 0)}
 ⏳ Будущих: {task_stats.get('future_tasks', 0)}
 🔄 Повторы: {task_stats.get('retry_tasks', 0)}
 
-<b>💾 БУФЕР ВОРКЕРА:</b>
-📊 Информация: {buffer_info}"""
+<b>⚙️ СИСТЕМА:</b>
+💾 Буфер воркера: до 3000 задач в памяти"""
         
         await call.message.edit_text(
             text,
@@ -1088,7 +1058,7 @@ async def stats_by_language(call: CallbackQuery):
 
 @main_router.channel_post(F.chat.type == ChatType.CHANNEL)
 async def handle_channel_post(message: Message):
-    """Обработка новых постов в каналах - создание задач просмотра"""
+    """Обработка новых постов в каналах - создание задач просмотра """
     try:
         channel_username = message.chat.username
         if not channel_username:
@@ -1099,18 +1069,16 @@ async def handle_channel_post(message: Message):
         
         logger.info(f"📝 Новый пост в @{channel_username}, ID: {post_id}")
         
-        # Создаем задачи просмотра с распределением на 10 часов
+        # Создаем задачи просмотра 
         results = await task_service.create_view_tasks_for_post(
             channel_username, post_id
         )
         
         if results['total_tasks'] > 0:
             logger.info(f"""
-✅ Задачи просмотра созданы:
+✅ Задачи просмотра созданы (простая система):
    📱 Задач: {results['total_tasks']}
    🌐 Языков: {results['languages']}
-   📦 Батчей: {results['batches_created']}
-   ⏰ Период: 10 часов
             """)
         else:
             logger.warning(f"⚠️ Не создано задач для @{channel_username}")
@@ -1182,5 +1150,3 @@ def get_all_routers():
         settings_router,
         stats_router
     ]
-
-

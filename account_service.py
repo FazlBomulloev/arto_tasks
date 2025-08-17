@@ -5,6 +5,7 @@ import shutil
 import time
 import os
 import random
+import json
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 from telethon import TelegramClient
@@ -22,44 +23,32 @@ from database import (
 from session_manager import global_session_manager
 from exceptions import AccountValidationError, FileProcessingError
 
-# Импорты для создания задач подписки
-try:
-    from task_service import TaskItem, TaskType
-except ImportError:
-    # Если task_service еще не загружен, создаем локальные определения
-    from dataclasses import dataclass
-    from enum import Enum
-    
-    class TaskType(Enum):
-        SUBSCRIBE = "subscribe"
-    
-    @dataclass
-    class TaskItem:
-        account_session: str
-        phone: str
-        channel: str  
-        lang: str
-        task_type: TaskType
-        execute_at: Optional[float] = None
-        retry_count: int = 0
-
 logger = logging.getLogger(__name__)
 
+# Импорты для создания задач подписки
+from dataclasses import dataclass
+from enum import Enum
+
+class TaskType(Enum):
+    SUBSCRIBE = "subscribe"
+
+@dataclass
+class TaskItem:
+    account_session: str
+    phone: str
+    channel: str  
+    lang: str
+    task_type: TaskType
+    execute_at: Optional[float] = None
+    retry_count: int = 0
+
 class AccountService:
-    """Сервис для управления аккаунтами"""
-    
     def __init__(self):
         self.validation_retries = 5
         self.validation_delay = 3.0
     
     async def add_accounts_from_zip(self, zip_path: Path, target_lang: str, 
                                   progress_callback=None) -> Dict[str, int]:
-        """
-        Добавляет аккаунты из ZIP с АДАПТИВНОЙ валидацией
-        
-        Returns:
-            Dict с результатами валидации и добавления
-        """
         results = {
             'total': 0,
             'validated': 0,
@@ -114,7 +103,18 @@ class AccountService:
             for key in ['validated', 'added', 'failed_validation', 'failed_db']:
                 results[key] += batch_results[key]
             
-            # 4. Финальный отчет
+            # 4. СОЗДАЕМ ЗАДАЧИ ПОДПИСКИ
+            if batch_results.get('added_accounts'):
+                if progress_callback:
+                    await progress_callback("📺 Создаю задачи подписки для новых аккаунтов...")
+                
+                subscription_stats = await self._create_subscription_tasks_for_new_accounts_simple(
+                    batch_results['added_accounts'], target_lang
+                )
+                
+                logger.info(f"📺 Создано {subscription_stats['tasks_created']} задач подписки в простой системе")
+            
+            # 5. Финальный отчет
             success_rate = (results['added'] / results['total']) * 100 if results['total'] > 0 else 0
             
             logger.info(f"""
@@ -175,9 +175,6 @@ class AccountService:
     
     async def _validate_and_add_batch_adaptive(self, accounts_batch: List[Dict], 
                                              target_lang: str, progress_callback=None) -> Dict[str, int]:
-        """
-        АДАПТИВНАЯ валидация с автоматическим расчетом времени
-        """
         results = {
             'validated': 0,
             'added': 0,
@@ -225,6 +222,9 @@ class AccountService:
         # Обновляем результаты
         for key in ['validated', 'added', 'failed_validation', 'failed_db']:
             results[key] = batch_results.get(key, 0)
+        
+        # Передаем добавленные аккаунты
+        results['added_accounts'] = batch_results.get('added_accounts', [])
         
         return results
 
@@ -290,10 +290,6 @@ class AccountService:
 
     async def _process_instant_mode(self, accounts_batch: List[Dict], target_lang: str, 
                                   params: Dict, progress_callback=None) -> Dict[str, int]:
-        """
-        МГНОВЕННЫЙ режим для малого количества аккаунтов (1-50)
-        Все аккаунты обрабатываются почти одновременно
-        """
         results = {
             'validated': 0, 
             'added': 0, 
@@ -339,25 +335,10 @@ class AccountService:
             else:
                 results['failed_db'] += 1
         
-        # СОЗДАЕМ ЗАДАЧИ ПОДПИСКИ для добавленных аккаунтов
-        if results['added_accounts']:
-            if progress_callback:
-                await progress_callback("📺 Создаю задачи подписки для новых аккаунтов...")
-            
-            subscription_stats = await self._create_subscription_tasks_for_new_accounts(
-                results['added_accounts'], target_lang
-            )
-            
-            logger.info(f"📺 Создано {subscription_stats['tasks_created']} задач подписки")
-        
         return results
 
     async def _process_fast_parallel_mode(self, accounts_batch: List[Dict], target_lang: str, 
                                         params: Dict, progress_callback=None) -> Dict[str, int]:
-        """
-        БЫСТРЫЙ ПАРАЛЛЕЛЬНЫЙ режим для среднего количества (51-500)
-        Обработка небольшими батчами с контролируемой параллельностью
-        """
         results = {
             'validated': 0, 
             'added': 0, 
@@ -393,30 +374,15 @@ class AccountService:
             # Собираем добавленные аккаунты
             results['added_accounts'].extend(batch_results.get('added_accounts', []))
             
-            # Пауза между батчами (кроме последнего)
+            # Пауза между батчами 
             if i + batch_size < total_accounts:
                 logger.info(f"⏳ Пауза {params['batch_pause']} сек между батчами...")
                 await asyncio.sleep(params['batch_pause'])
-        
-        # СОЗДАЕМ ЗАДАЧИ ПОДПИСКИ для всех добавленных аккаунтов
-        if results['added_accounts']:
-            if progress_callback:
-                await progress_callback("📺 Создаю задачи подписки для новых аккаунтов...")
-            
-            subscription_stats = await self._create_subscription_tasks_for_new_accounts(
-                results['added_accounts'], target_lang
-            )
-            
-            logger.info(f"📺 Создано {subscription_stats['tasks_created']} задач подписки")
         
         return results
 
     async def _process_distributed_mode(self, accounts_batch: List[Dict], target_lang: str, 
                                       params: Dict, progress_callback=None) -> Dict[str, int]:
-        """
-        РАСПРЕДЕЛЕННЫЙ режим для большого количества (500+)
-        Постепенная обработка с учетом лимитов Telegram API
-        """
         results = {
             'validated': 0, 
             'added': 0, 
@@ -475,23 +441,9 @@ class AccountService:
                 logger.info(f"⏳ Пауза {pause_time:.0f} сек между батчами...")
                 await asyncio.sleep(pause_time)
         
-        # СОЗДАЕМ ЗАДАЧИ ПОДПИСКИ для всех добавленных аккаунтов
-        if results['added_accounts']:
-            if progress_callback:
-                await progress_callback("📺 Создаю задачи подписки для новых аккаунтов...")
-            
-            subscription_stats = await self._create_subscription_tasks_for_new_accounts(
-                results['added_accounts'], target_lang
-            )
-            
-            logger.info(f"📺 Создано {subscription_stats['tasks_created']} задач подписки")
-        
         return results
 
     async def _validate_parallel_batch_optimized(self, batch: List[Dict], target_lang: str, params: Dict) -> Dict[str, int]:
-        """
-        Оптимизированная параллельная валидация с настраиваемыми параметрами
-        """
         results = {
             'validated': 0, 
             'added': 0, 
@@ -539,9 +491,7 @@ class AccountService:
 
     async def _validate_and_add_single_optimized(self, account_data: Dict, target_lang: str, 
                                                delay: float, params: Dict) -> Dict:
-        """
-        Оптимизированная валидация одного аккаунта с адаптивными параметрами
-        """
+
         # Ждем перед началом обработки
         if delay > 0:
             await asyncio.sleep(delay)
@@ -583,9 +533,6 @@ class AccountService:
             return {'success': False, 'phone': phone, 'error': str(e)}
 
     async def _validate_single_account_adaptive(self, account_data: Dict, params: Dict) -> str:
-        """
-        Адаптивная валидация аккаунта с параметрами под конкретный режим
-        """
         phone = account_data['phone']
         tdata_path = account_data['tdata_path']
         
@@ -661,10 +608,7 @@ class AccountService:
         
         raise AccountValidationError(f"Max adaptive validation retries exceeded for {phone}")
     
-    async def _create_subscription_tasks_for_new_accounts(self, new_accounts: List[Dict], target_lang: str) -> Dict[str, int]:
-        """
-        Создает задачи подписки для новых аккаунтов на все существующие каналы языка
-        """
+    async def _create_subscription_tasks_for_new_accounts_simple(self, new_accounts: List[Dict], target_lang: str) -> Dict[str, int]:
         subscription_stats = {
             'channels_found': 0,
             'tasks_created': 0,
@@ -686,8 +630,8 @@ class AccountService:
             # Создаем задачи подписки для каждого канала
             for channel_name in channels:
                 try:
-                    # Создаем задачи подписки только для новых аккаунтов
-                    results = await self._create_subscription_tasks_for_accounts(
+                    # Создаем задачи подписки только для новых аккаунтов в ПРОСТОЙ СИСТЕМЕ
+                    results = await self._create_subscription_tasks_for_accounts_simple(
                         channel_name, new_accounts, target_lang
                     )
                     
@@ -713,10 +657,7 @@ class AccountService:
             logger.error(f"💥 Ошибка создания задач подписки: {e}")
             return subscription_stats
 
-    async def _create_subscription_tasks_for_accounts(self, channel_name: str, accounts: List[Dict], target_lang: str) -> Dict[str, int]:
-        """
-        Создает задачи подписки для конкретных аккаунтов на один канал
-        """
+    async def _create_subscription_tasks_for_accounts_simple(self, channel_name: str, accounts: List[Dict], target_lang: str) -> Dict[str, int]:
         results = {
             'total_tasks': 0,
             'accounts_processed': 0
@@ -768,8 +709,8 @@ class AccountService:
                 
                 subscription_tasks.append(task)
             
-            # Отправляем задачи в очередь
-            await self._schedule_subscription_tasks_direct(subscription_tasks)
+            # Отправляем задачи в  task_queue
+            await self._schedule_subscription_tasks_simple(subscription_tasks)
             
             results['total_tasks'] = len(subscription_tasks)
             results['accounts_processed'] = len(accounts)
@@ -808,14 +749,10 @@ class AccountService:
         
         return total_delay
 
-    async def _schedule_subscription_tasks_direct(self, tasks):
-        """
-        Планирует задачи подписки напрямую в Redis
-        """
+    async def _schedule_subscription_tasks_simple(self, tasks):
         try:
             from redis import Redis
             from config import REDIS_HOST, REDIS_PORT, REDIS_PASSWORD
-            import json
             
             redis_client = Redis(
                 host=REDIS_HOST,
@@ -826,6 +763,9 @@ class AccountService:
             
             # Сортируем задачи по времени выполнения
             tasks.sort(key=lambda x: x.execute_at)
+            
+            # Подготавливаем данные для простой очереди
+            tasks_data = {}
             
             for task in tasks:
                 task_data = {
@@ -839,34 +779,25 @@ class AccountService:
                     'created_at': time.time()
                 }
                 
-                # Добавляем в очередь подписок
-                redis_client.lpush("subscription_tasks", json.dumps(task_data))
+                # Используем execute_at как score для сортировки
+                tasks_data[json.dumps(task_data)] = task.execute_at
             
-            # TTL на 48 часов
-            redis_client.expire("subscription_tasks", 48 * 3600)
-            
-            logger.info(f"📋 Запланировано {len(tasks)} задач подписки")
+            # Добавляем в единую очередь task_queue
+            if tasks_data:
+                redis_client.zadd("task_queue", tasks_data)
+                
+                # TTL на 48 часов
+                redis_client.expire("task_queue", 48 * 3600)
+                
+                logger.info(f"📋 Запланировано {len(tasks)} задач подписки")
             
         except Exception as e:
             logger.error(f"Ошибка планирования задач подписки: {e}")
     
-    # ========== СТАРЫЕ МЕТОДЫ ДЛЯ СОВМЕСТИМОСТИ ==========
-    
-    async def add_accounts_from_zip_with_validation(self, zip_path: Path, target_lang: str, 
-                                                  progress_callback=None) -> Dict[str, int]:
-        """
-        Добавляет аккаунты из ZIP с ОБЯЗАТЕЛЬНОЙ валидацией (теперь адаптивной)
-        """
-        return await self.add_accounts_from_zip(zip_path, target_lang, progress_callback)
+    # ========== БЫСТРОЕ ДОБАВЛЕНИЕ БЕЗ ВАЛИДАЦИИ ==========
     
     async def add_accounts_from_zip_fast(self, zip_path: Path, target_lang: str, 
                                        progress_callback=None) -> Dict[str, int]:
-        """
-        Быстрое добавление аккаунтов БЕЗ проверки авторизации
-        
-        Returns:
-            Dict с результатами добавления
-        """
         results = {
             'total': 0,
             'added': 0,
@@ -954,12 +885,12 @@ class AccountService:
                     logger.error(f"Ошибка добавления {phone}: {e}")
                     results['failed_db'] += 1
             
-            # 4. СОЗДАЕМ ЗАДАЧИ ПОДПИСКИ для добавленных аккаунтов
+            # 4. СОЗДАЕМ ЗАДАЧИ ПОДПИСКИ для добавленных аккаунтов в ПРОСТОЙ СИСТЕМЕ
             if added_accounts:
                 if progress_callback:
                     await progress_callback("📺 Создаю задачи подписки для новых аккаунтов...")
                 
-                subscription_stats = await self._create_subscription_tasks_for_new_accounts(
+                subscription_stats = await self._create_subscription_tasks_for_new_accounts_simple(
                     added_accounts, target_lang
                 )
                 
@@ -990,9 +921,6 @@ class AccountService:
                     logger.warning(f"Не удалось удалить временные файлы: {e}")
     
     async def _convert_tdata_to_session_fast(self, account_data: Dict) -> Optional[str]:
-        """
-        Быстрая конвертация tdata в session_data БЕЗ подключения к Telegram
-        """
         phone = account_data['phone']
         tdata_path = account_data['tdata_path']
         temp_session_path = None
@@ -1042,17 +970,9 @@ class AccountService:
                 except:
                     pass
     
+    # ========== УДАЛЕНИЕ И ЭКСПОРТ ==========
+    
     async def delete_accounts_by_status(self, status: str, limit: int = None) -> int:
-        """
-        Удаляет аккаунты по статусу
-        
-        Args:
-            status: статус для удаления ('ban', 'pause', etc.)
-            limit: максимальное количество для удаления
-            
-        Returns:
-            количество удаленных аккаунтов
-        """
         try:
             # Получаем аккаунты которые будем удалять
             if status == 'all':
@@ -1087,15 +1007,6 @@ class AccountService:
             return 0
     
     async def export_active_accounts(self, target_lang: Optional[str] = None) -> Optional[Path]:
-        """
-        Экспортирует активные аккаунты в ZIP архив с session_data (не файлами)
-        
-        Args:
-            target_lang: экспортировать только указанный язык (опционально)
-            
-        Returns:
-            Path к созданному архиву или None если ошибка
-        """
         try:
             # Получаем активные аккаунты
             if target_lang:
@@ -1153,6 +1064,7 @@ Language: {lang}
 Status: {account.get('status', 'active')}
 Exported: {time.strftime('%Y-%m-%d %H:%M:%S')}
 Session: {session_data[:50]}...
+System: Simple task_queue
 """
                         info_file.write_text(info_content, encoding='utf-8')
                         

@@ -109,7 +109,6 @@ class SimpleTaskService:
    📺 Пост: {post_id}
    🌐 Языков: {results['languages']}  
    ⏰ Период: {view_hours} часов
-   📋 Очередь: task_queue
             """)
             
             return results
@@ -253,7 +252,6 @@ class SimpleTaskService:
 ✅ Создано {results['total_tasks']} задач подписки:
    📺 Канал: @{channel_name}
    📱 Аккаунтов: {results['accounts_processed']}
-   📋 Очередь: task_queue
             """)
             
             return results
