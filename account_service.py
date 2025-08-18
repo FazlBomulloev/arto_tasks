@@ -112,7 +112,7 @@ class AccountService:
                     batch_results['added_accounts'], target_lang
                 )
                 
-                logger.info(f"📺 Создано {subscription_stats['tasks_created']} задач подписки в простой системе")
+                logger.info(f"📺 Создано {subscription_stats['tasks_created']} задач подписки")
             
             # 5. Финальный отчет
             success_rate = (results['added'] / results['total']) * 100 if results['total'] > 0 else 0
@@ -630,7 +630,7 @@ class AccountService:
             # Создаем задачи подписки для каждого канала
             for channel_name in channels:
                 try:
-                    # Создаем задачи подписки только для новых аккаунтов в ПРОСТОЙ СИСТЕМЕ
+                    # Создаем задачи подписки только для новых аккаунтов 
                     results = await self._create_subscription_tasks_for_accounts_simple(
                         channel_name, new_accounts, target_lang
                     )
@@ -764,7 +764,7 @@ class AccountService:
             # Сортируем задачи по времени выполнения
             tasks.sort(key=lambda x: x.execute_at)
             
-            # Подготавливаем данные для простой очереди
+            # Подготавливаем данные
             tasks_data = {}
             
             for task in tasks:
@@ -885,7 +885,7 @@ class AccountService:
                     logger.error(f"Ошибка добавления {phone}: {e}")
                     results['failed_db'] += 1
             
-            # 4. СОЗДАЕМ ЗАДАЧИ ПОДПИСКИ для добавленных аккаунтов в ПРОСТОЙ СИСТЕМЕ
+            # 4. СОЗДАЕМ ЗАДАЧИ ПОДПИСКИ для добавленных аккаунтов 
             if added_accounts:
                 if progress_callback:
                     await progress_callback("📺 Создаю задачи подписки для новых аккаунтов...")

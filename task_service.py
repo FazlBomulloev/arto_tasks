@@ -351,5 +351,5 @@ class SimpleTaskService:
             logger.error(f"Ошибка получения статистики задач: {e}")
             return {}
 
-# Глобальный экземпляр простого сервиса
+# Глобальный экземпляр 
 task_service = SimpleTaskService()

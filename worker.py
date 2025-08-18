@@ -10,7 +10,7 @@ from telethon.errors import FloodWaitError, RPCError, AuthKeyInvalidError
 from telethon.tl.functions.messages import GetMessagesViewsRequest
 from telethon.tl.functions.channels import JoinChannelRequest
 
-from config import find_lang_code, API_ID, API_HASH, read_setting
+from config import find_lang_code, API_ID, API_HASH, read_setting, REDIS_HOST, REDIS_PORT, REDIS_PASSWORD
 from database import (
     init_db_pool, shutdown_db_pool, update_account_status,
     increment_account_fails, reset_account_fails, 
@@ -19,7 +19,6 @@ from database import (
 from session_manager import global_session_manager
 from exceptions import SessionError, RateLimitError
 from redis import Redis
-from config import REDIS_HOST, REDIS_PORT, REDIS_PASSWORD
 
 # Настройка логгера для воркера
 logging.basicConfig(
@@ -39,16 +38,25 @@ class TaskWorker:
         self.max_retries = 3
         self.sessions_loaded = False
         
+        # Оптимизированный буфер
         self.task_buffer = deque()  # Очередь задач в памяти
-        self.max_buffer_size = 3000  # Максимум задач в буфере
-        self.min_buffer_size = 2990
+        self.max_buffer_size = 1500  # Максимум задач в буфере
+        self.min_buffer_size = 1400  # Минимум для догрузки
+        
+        # 🆕 НОВОЕ: Флаги для предотвращения блокировок
+        self.buffer_updating = False  # Флаг актуализации буфера
+        self.buffer_lock = asyncio.Lock()  # Лок для безопасности
         
         # Счетчики производительности
         self.processed_tasks = 0
         self.last_buffer_load = 0
         
+        # 🆕 Кэш настроек для правильных задержек
+        self.cached_settings = {}
+        self.last_settings_update = 0
+        
     async def start(self):
-        logger.info("🚀 Запуск Simple Task Worker...")
+        logger.info("🚀 Запуск улучшенного Task Worker с асинхронной актуализацией...")
         
         try:
             # Инициализация БД
@@ -64,6 +72,9 @@ class TaskWorker:
             )
             logger.info("✅ Redis подключен")
             
+            # Загружаем настройки
+            await self._update_cached_settings()
+            
             # Загружаем сессии
             logger.info("🧠 Загрузка сессий...")
             await self._try_preload_sessions()
@@ -77,6 +88,34 @@ class TaskWorker:
             raise
         finally:
             await self._shutdown()
+    
+    async def _update_cached_settings(self):
+        """Обновляет кэшированные настройки"""
+        try:
+            self.cached_settings = {
+                'view_period': read_setting('followPeriod.txt', 3.0) * 3600,  # в секундах
+                'view_delay': read_setting('delay.txt', 20.0) * 60,  # в секундах
+                'sub_lag': read_setting('lag.txt', 14.0) * 60,  # в секундах 
+                'sub_range': read_setting('range.txt', 5.0) * 60,  # в секундах
+                'accounts_delay': read_setting('accounts_delay.txt', 2.0) * 60,  # в секундах
+                'timeout_count': int(read_setting('timeout_count.txt', 3.0)),
+                'timeout_duration': read_setting('timeout_duration.txt', 13.0) * 60  # в секундах
+            }
+            self.last_settings_update = time.time()
+            
+            logger.info(f"""
+⚙️ НАСТРОЙКИ ВОРКЕРА ОБНОВЛЕНЫ:
+   👀 Период просмотров: {self.cached_settings['view_period']/3600:.1f} часов
+   ⏰ Задержка просмотров: {self.cached_settings['view_delay']/60:.1f} мин
+   📺 Базовая задержка подписок: {self.cached_settings['sub_lag']/60:.1f} мин
+   🎲 Разброс подписок: {self.cached_settings['sub_range']/60:.1f} мин
+   ⏳ Между аккаунтами: {self.cached_settings['accounts_delay']/60:.1f} мин
+   🔢 Подписок до паузы: {self.cached_settings['timeout_count']}
+   ⏸️ Длительность паузы: {self.cached_settings['timeout_duration']/60:.1f} мин
+            """)
+            
+        except Exception as e:
+            logger.error(f"Ошибка обновления настроек: {e}")
     
     async def _try_preload_sessions(self):
         """Пытается загрузить сессии"""
@@ -95,17 +134,22 @@ class TaskWorker:
             self.sessions_loaded = False
     
     async def _main_loop(self):
-        logger.info("🔄 Запуск цикла обработки задач с буфером")
+        logger.info("🔄 Запуск цикла обработки задач с асинхронной актуализацией")
         
         last_stats_time = time.time()
         last_session_check = time.time()
         last_ban_check = time.time()
         last_buffer_info = time.time()
+        buffer_check_counter = 0
         
         while self.running:
             try:
                 # Проверяем команды от бота
                 await self._process_worker_commands()
+                
+                # Обновляем настройки каждые 5 минут
+                if time.time() - self.last_settings_update > 300:
+                    await self._update_cached_settings()
                 
                 # Если сессии не загружены, пытаемся загрузить
                 if not self.sessions_loaded and time.time() - last_session_check > 300:
@@ -119,10 +163,18 @@ class TaskWorker:
                     last_ban_check = time.time()
                 
                 if self.sessions_loaded:
+                    # 🆕 НОВОЕ: Асинхронная актуализация буфера каждую минуту
+                    buffer_check_counter += 1
+                    if buffer_check_counter >= 30:  # 30 * 2 сек = 1 минута
+                        # Запускаем актуализацию в фоне, не ждем завершения
+                        if not self.buffer_updating:
+                            asyncio.create_task(self._async_smart_buffer_management())
+                        buffer_check_counter = 0
                     
                     await self._fill_task_buffer()
-        
-                    processed = await self._process_buffer_tasks()
+                    
+                    # 🆕 НОВОЕ: Проверяем актуальность сессий перед выполнением
+                    processed = await self._process_buffer_tasks_with_session_check()
                     self.processed_tasks += processed
                     
                     await self._process_retry_tasks()
@@ -131,8 +183,10 @@ class TaskWorker:
                         health_stats = await global_session_manager.health_check()
                         if health_stats.get('removed_dead', 0) > 0:
                             logger.info(f"🔧 Очищено {health_stats['removed_dead']} мертвых сессий")
+                            # После очистки сессий, очищаем буфер от задач мертвых аккаунтов
+                            asyncio.create_task(self._cleanup_buffer_dead_sessions())
                 
-
+                # Информация о буфере каждые 90 секунд
                 if time.time() - last_buffer_info > 90:
                     await self._log_buffer_info()
                     last_buffer_info = time.time()
@@ -155,11 +209,202 @@ class TaskWorker:
                 logger.error(f"❌ Ошибка в главном цикле: {e}")
                 await asyncio.sleep(5)
     
+    async def _async_smart_buffer_management(self):
+        """🆕 Асинхронная актуализация буфера без блокировки выполнения"""
+        if self.buffer_updating:
+            return
+        
+        self.buffer_updating = True
+        try:
+            async with self.buffer_lock:
+                current_time = time.time()
+                
+                # Анализируем текущий буфер
+                buffer_analysis = self._analyze_buffer_tasks()
+                
+                # Если в буфере много готовых задач, актуализацию не делаем
+                if buffer_analysis['ready_now'] > 200:
+                    logger.debug(f"🔒 Много готовых задач ({buffer_analysis['ready_now']}), актуализация отложена")
+                    return
+                
+                # Получаем приоритетные задачи из Redis для анализа
+                redis_priority_tasks = self.redis_client.zrangebyscore(
+                    "task_queue",
+                    min=0,
+                    max='+inf',
+                    withscores=True,
+                    start=0,
+                    num=2000
+                )
+                
+                if not redis_priority_tasks:
+                    logger.debug("📋 Нет задач в Redis для актуализации")
+                    return
+                
+                # Выполняем умную актуализацию
+                logger.debug(f"""
+🧠 АСИНХРОННАЯ АКТУАЛИЗАЦИЯ БУФЕРА:
+   📋 В буфере: {buffer_analysis['total']} задач
+   ⏰ Готовых в буфере: {buffer_analysis['ready_now']}
+   🕐 Готовых в 5 мин: {buffer_analysis['ready_5min']}
+   📦 Задач в Redis: {len(redis_priority_tasks)}
+                """)
+                
+                await self._reorder_buffer_tasks_safe(redis_priority_tasks, current_time)
+        
+        except Exception as e:
+            logger.error(f"Ошибка асинхронной актуализации буфера: {e}")
+        finally:
+            self.buffer_updating = False
+    
+    async def _reorder_buffer_tasks_safe(self, redis_priority_tasks: List, current_time: float):
+        """Безопасная умная актуализация буфера с защитой готовых задач"""
+        try:
+            # 1. Разделяем задачи в буфере на готовые и будущие
+            ready_tasks = []  # Готовые к выполнению - оставляем
+            future_tasks = []  # Будущие - возвращаем в Redis для актуализации
+            
+            # Создаем временную копию буфера для безопасной работы
+            buffer_copy = list(self.task_buffer)
+            
+            for task in buffer_copy:
+                execute_at = task.get('execute_at', current_time)
+                if execute_at <= current_time + 30:  # Готовые сейчас + 30 сек запас
+                    ready_tasks.append(task)
+                else:
+                    future_tasks.append(task)
+            
+            # 2. Возвращаем только будущие задачи в Redis
+            returned_count = 0
+            if future_tasks:
+                redis_return_data = {}
+                for task in future_tasks:
+                    task_json = json.dumps(task)
+                    execute_at = task.get('execute_at', current_time)
+                    redis_return_data[task_json] = execute_at
+                
+                if redis_return_data:
+                    self.redis_client.zadd("task_queue", redis_return_data)
+                    returned_count = len(future_tasks)
+            
+            # 3. Определяем сколько новых задач нужно загрузить
+            spots_available = self.max_buffer_size - len(ready_tasks)
+            
+            if spots_available <= 200:  # Если мало места, оставляем как есть
+                self.task_buffer = deque(ready_tasks)
+                logger.debug(f"🔒 Буфер заполнен готовыми задачами, актуализация отложена")
+                return
+            
+            # 4. Загружаем самые актуальные задачи из Redis
+            fresh_tasks = self.redis_client.zrangebyscore(
+                "task_queue",
+                min=0,
+                max='+inf',
+                withscores=True,
+                start=0,
+                num=spots_available
+            )
+            
+            loaded_count = 0
+            new_tasks = []
+            
+            for task_json, score in fresh_tasks:
+                try:
+                    task_data = json.loads(task_json)
+                    task_data['score'] = score
+                    
+                    # Проверяем что сессия аккаунта еще активна
+                    session_data = task_data.get('account_session')
+                    if session_data and global_session_manager.get_client(session_data):
+                        new_tasks.append(task_data)
+                        loaded_count += 1
+                        # Удаляем из Redis
+                        self.redis_client.zrem("task_queue", task_json)
+                    else:
+                        # Удаляем задачу с неактивной сессией
+                        self.redis_client.zrem("task_queue", task_json)
+                        logger.debug(f"🗑️ Удалена задача с неактивной сессией: {task_data.get('phone', 'unknown')}")
+                    
+                except Exception as e:
+                    logger.error(f"Ошибка загрузки актуальной задачи: {e}")
+                    # Удаляем битую задачу
+                    self.redis_client.zrem("task_queue", task_json)
+            
+            # 5. Безопасно обновляем буфер
+            all_tasks = ready_tasks + new_tasks
+            if all_tasks:
+                sorted_tasks = sorted(all_tasks, key=lambda x: x.get('execute_at', current_time))
+                self.task_buffer = deque(sorted_tasks)
+            else:
+                self.task_buffer = deque()
+            
+            # 6. Статистика умной актуализации
+            ready_now = sum(1 for t in self.task_buffer if t.get('execute_at', 0) <= current_time)
+            ready_5min = sum(1 for t in self.task_buffer 
+                            if current_time < t.get('execute_at', 0) <= current_time + 300)
+            
+            logger.info(f"""
+✅ АСИНХРОННАЯ АКТУАЛИЗАЦИЯ ЗАВЕРШЕНА:
+   🔒 Сохранено готовых: {len(ready_tasks)} задач
+   🔄 Возвращено в Redis: {returned_count} задач
+   📥 Загружено свежих: {loaded_count} задач  
+   📋 Итого в буфере: {len(self.task_buffer)}/1500
+   ⏰ Готовых сейчас: {ready_now}
+   🕐 Готовых в 5 мин: {ready_5min}
+            """)
+        
+        except Exception as e:
+            logger.error(f"Ошибка безопасной актуализации буфера: {e}")
+    
+    async def _cleanup_buffer_dead_sessions(self):
+        """🆕 Очищает буфер от задач с мертвыми сессиями"""
+        try:
+            async with self.buffer_lock:
+                alive_tasks = []
+                removed_count = 0
+                
+                for task in self.task_buffer:
+                    session_data = task.get('account_session')
+                    if session_data and global_session_manager.get_client(session_data):
+                        alive_tasks.append(task)
+                    else:
+                        removed_count += 1
+                
+                if removed_count > 0:
+                    self.task_buffer = deque(alive_tasks)
+                    logger.info(f"🧹 Очищено {removed_count} задач с мертвыми сессиями из буфера")
+                    
+        except Exception as e:
+            logger.error(f"Ошибка очистки мертвых сессий из буфера: {e}")
+    
+    def _analyze_buffer_tasks(self) -> Dict:
+        """Простой анализ задач в буфере"""
+        current_time = time.time()
+        
+        analysis = {
+            'total': len(self.task_buffer),
+            'ready_now': 0,
+            'ready_5min': 0,
+            'future': 0
+        }
+        
+        for task in self.task_buffer:
+            execute_at = task.get('execute_at', current_time)
+            
+            if execute_at <= current_time:
+                analysis['ready_now'] += 1
+            elif execute_at <= current_time + 300:  # 5 минут
+                analysis['ready_5min'] += 1
+            else:
+                analysis['future'] += 1
+        
+        return analysis
+    
     async def _fill_task_buffer(self):
         """Загружает готовые задачи из Redis в буфер памяти"""
         try:
             # Проверяем нужно ли загружать
-            if len(self.task_buffer) >= self.min_buffer_size:
+            if len(self.task_buffer) >= self.min_buffer_size or self.buffer_updating:
                 return
             
             current_time = time.time()
@@ -182,22 +427,26 @@ class TaskWorker:
             
             loaded_count = 0
             
-            for task_json, score in ready_tasks_data:
-                try:
-                    task_data = json.loads(task_json)
-                    task_data['score'] = score  # Сохраняем оригинальный score
-                    
-                    # Добавляем в буфер
-                    self.task_buffer.append(task_data)
-                    loaded_count += 1
-                    
-                    # Удаляем из Redis после загрузки в буфер
-                    self.redis_client.zrem("task_queue", task_json)
-                    
-                except Exception as e:
-                    logger.error(f"Ошибка загрузки задачи в буфер: {e}")
-                    # Удаляем битую задачу
-                    self.redis_client.zrem("task_queue", task_json)
+            async with self.buffer_lock:
+                for task_json, score in ready_tasks_data:
+                    try:
+                        task_data = json.loads(task_json)
+                        task_data['score'] = score
+                        
+                        # Проверяем что сессия активна
+                        session_data = task_data.get('account_session')
+                        if session_data and global_session_manager.get_client(session_data):
+                            # Добавляем в буфер
+                            self.task_buffer.append(task_data)
+                            loaded_count += 1
+                        
+                        # Удаляем из Redis в любом случае
+                        self.redis_client.zrem("task_queue", task_json)
+                        
+                    except Exception as e:
+                        logger.error(f"Ошибка загрузки задачи в буфер: {e}")
+                        # Удаляем битую задачу
+                        self.redis_client.zrem("task_queue", task_json)
             
             if loaded_count > 0:
                 self.last_buffer_load = time.time()
@@ -206,8 +455,8 @@ class TaskWorker:
         except Exception as e:
             logger.error(f"Ошибка загрузки задач в буфер: {e}")
     
-    async def _process_buffer_tasks(self) -> int:
-        """Обрабатывает готовые задачи из буфера"""
+    async def _process_buffer_tasks_with_session_check(self) -> int:
+        """🆕 Обрабатывает готовые задачи из буфера с проверкой сессий"""
         if not self.task_buffer:
             return 0
         
@@ -221,13 +470,39 @@ class TaskWorker:
             if not self.task_buffer:
                 break
             
-            # Берем задачу из начала очереди
-            task = self.task_buffer.popleft()
-            
-            # Проверяем время выполнения
-            if task.get('execute_at', 0) > current_time:
-                self.task_buffer.appendleft(task)
+            # Безопасно берем задачу из буфера
+            try:
+                async with self.buffer_lock:
+                    if not self.task_buffer:
+                        break
+                    task = self.task_buffer.popleft()
+            except Exception:
                 break
+            
+            # Проверяем время выполнения с учетом правильных задержек
+            execute_at = task.get('execute_at', 0)
+            task_type = task.get('task_type', '')
+            
+            # 🆕 ИСПРАВЛЕНИЕ: Проверяем правильное время для подписок
+            if task_type == 'subscribe':
+                # Для подписок минимальная задержка должна быть lag.txt (14 минут)
+                min_delay = self.cached_settings['sub_lag']
+                if execute_at > current_time:
+                    async with self.buffer_lock:
+                        self.task_buffer.appendleft(task)
+                    break
+            else:
+                # Для просмотров стандартная проверка времени
+                if execute_at > current_time:
+                    async with self.buffer_lock:
+                        self.task_buffer.appendleft(task)
+                    break
+            
+            # 🆕 НОВОЕ: Проверяем что сессия еще активна перед выполнением
+            session_data = task.get('account_session')
+            if not session_data or not global_session_manager.get_client(session_data):
+                logger.debug(f"⚠️ Пропущена задача с неактивной сессией: {task.get('phone', 'unknown')}")
+                continue
             
             # Выполняем задачу
             try:
@@ -235,8 +510,13 @@ class TaskWorker:
                 if success:
                     processed_count += 1
                 
-                # Небольшая задержка между задачами
-                await asyncio.sleep(random.uniform(0.1, 0.5))
+                # Задержка между задачами с учетом типа
+                if task_type == 'subscribe':
+                    delay = random.uniform(2.0, 5.0)  # Больше задержка для подписок
+                else:
+                    delay = random.uniform(0.1, 0.5)  # Стандартная для просмотров
+                
+                await asyncio.sleep(delay)
                 
             except Exception as e:
                 logger.error(f"Ошибка выполнения задачи: {e}")
@@ -287,7 +567,8 @@ class TaskWorker:
             ))
             
             # Имитируем время чтения
-            await asyncio.sleep(random.uniform(3, 7))
+            reading_time = random.uniform(3, 7)
+            await asyncio.sleep(reading_time)
             
             # Успех
             await self._handle_task_success(phone)
@@ -305,12 +586,8 @@ class TaskWorker:
             return False
             
         except Exception as e:
-            logger.error(f"💥 {phone}: неожиданная ошибка - {e}")
-            await self._handle_task_failure(phone, 'view')
-            return False
-    
+            pass
     async def _execute_subscription_task(self, task: Dict) -> bool:
-        """Выполняет задачу подписки"""
         session_data = task['account_session']
         phone = task['phone']
         channel = task['channel']
@@ -332,12 +609,29 @@ class TaskWorker:
                 await self._handle_task_failure(phone, 'subscription')
                 return False
             
+            # 🆕 ВАЖНО: Логируем время выполнения подписки для отладки
+            created_at = task.get('created_at', 0)
+            execute_at = task.get('execute_at', 0)
+            current_time = time.time()
+            
+            actual_delay = (current_time - created_at) / 60  # в минутах
+            planned_delay = (execute_at - created_at) / 60   # в минутах
+            
+            logger.info(f"""
+📺 ВЫПОЛНЕНИЕ ПОДПИСКИ:
+   📱 Аккаунт: {phone}
+   📺 Канал: @{channel}
+   ⏰ Планируемая задержка: {planned_delay:.1f} мин
+   🕐 Фактическая задержка: {actual_delay:.1f} мин
+   ⚙️ Настройки: lag={self.cached_settings['sub_lag']/60:.1f}мин, range={self.cached_settings['sub_range']/60:.1f}мин
+            """)
+            
             # Выполняем подписку
             await client(JoinChannelRequest(channel_entity))
             
             # Успех
             await self._handle_task_success(phone)
-            logger.info(f"✅ {phone}: подписан на @{channel}")
+            logger.info(f"✅ {phone}: подписан на @{channel} (задержка: {actual_delay:.1f} мин)")
             return True
             
         except FloodWaitError as e:
@@ -365,19 +659,99 @@ class TaskWorker:
             logger.error(f"Ошибка обработки успеха для {phone}: {e}")
 
     async def _handle_task_failure(self, phone: str, task_type: str):
-        """Обрабатывает неудачное выполнение задачи"""
+        """Обрабатывает неудачное выполнение задачи (обновленная версия)"""
         try:
             fail_count = await increment_account_fails(phone)
             
             if fail_count >= 3:
                 await update_account_status(phone, 'ban')
                 logger.warning(f"🚫 {phone}: переведен в BAN (неудач: {fail_count})")
+                
+                # Удаляем сессию из пула
                 await global_session_manager.remove_session_by_phone(phone)
+                
+                # 🆕 НОВОЕ: Удаляем все задачи этого аккаунта асинхронно
+                asyncio.create_task(self._remove_tasks_for_banned_account_async(phone))
             else:
                 logger.debug(f"⚠️ {phone}: неудача {fail_count}/3 ({task_type})")
                 
         except Exception as e:
             logger.error(f"Ошибка обработки неудачи для {phone}: {e}")
+    
+    async def _remove_tasks_for_banned_account_async(self, phone: str):
+        """🆕 Асинхронно удаляет все задачи забаненного аккаунта"""
+        try:
+            removed_from_redis = 0
+            removed_from_buffer = 0
+            
+            # 1. Удаляем из буфера памяти (быстро)
+            async with self.buffer_lock:
+                buffer_tasks_to_keep = []
+                for task in self.task_buffer:
+                    if task.get('phone') != phone:
+                        buffer_tasks_to_keep.append(task)
+                    else:
+                        removed_from_buffer += 1
+                
+                self.task_buffer = deque(buffer_tasks_to_keep)
+            
+            # 2. Удаляем из Redis очереди (может быть медленно, делаем асинхронно)
+            # Используем SCAN для избежания блокировки Redis
+            cursor = 0
+            while True:
+                cursor, keys = self.redis_client.zscan("task_queue", cursor, count=100)
+                
+                for task_json, score in keys.items():
+                    try:
+                        task_data = json.loads(task_json)
+                        if task_data.get('phone') == phone:
+                            self.redis_client.zrem("task_queue", task_json)
+                            removed_from_redis += 1
+                    except Exception as e:
+                        logger.error(f"Ошибка обработки задачи Redis: {e}")
+                
+                if cursor == 0:
+                    break
+                
+                # Небольшая пауза чтобы не блокировать Redis
+                await asyncio.sleep(0.01)
+            
+            # 3. Удаляем из retry очереди
+            retry_tasks = []
+            removed_from_retry = 0
+            
+            # Получаем все retry задачи
+            all_retry_tasks = self.redis_client.lrange('retry_tasks', 0, -1)
+            
+            for retry_task_json in all_retry_tasks:
+                try:
+                    retry_task = json.loads(retry_task_json)
+                    if retry_task.get('phone') != phone:
+                        retry_tasks.append(retry_task_json)
+                    else:
+                        removed_from_retry += 1
+                except:
+                    retry_tasks.append(retry_task_json)  # Сохраняем битые задачи
+            
+            # Заменяем всю retry очередь
+            if all_retry_tasks:
+                self.redis_client.delete('retry_tasks')
+                if retry_tasks:
+                    self.redis_client.lpush('retry_tasks', *retry_tasks)
+            
+            total_removed = removed_from_redis + removed_from_buffer + removed_from_retry
+            
+            if total_removed > 0:
+                logger.info(f"""
+🗑️ АСИНХРОННО очищены задачи забаненного аккаунта {phone}:
+   📦 Из Redis: {removed_from_redis}
+   💾 Из буфера: {removed_from_buffer}  
+   🔄 Из retry: {removed_from_retry}
+   📊 Всего удалено: {total_removed}
+                """)
+            
+        except Exception as e:
+            logger.error(f"Ошибка асинхронной очистки задач для {phone}: {e}")
     
     async def _add_to_retry_queue(self, task: Dict, task_type: str, delay: int = 0):
         """Добавляет задачу в очередь повторов"""
@@ -411,10 +785,15 @@ class TaskWorker:
                     
                     # Проверяем время повтора
                     if task.get('retry_after', 0) <= current_time:
-                        # Время пришло - выполняем
-                        success = await self._execute_task(task)
-                        if success:
-                            logger.debug(f"✅ Retry задача выполнена успешно")
+                        # Проверяем что сессия еще активна
+                        session_data = task.get('account_session')
+                        if session_data and global_session_manager.get_client(session_data):
+                            # Время пришло и сессия активна - выполняем
+                            success = await self._execute_task(task)
+                            if success:
+                                logger.debug(f"✅ Retry задача выполнена успешно")
+                        else:
+                            logger.debug(f"🗑️ Retry задача отброшена - неактивная сессия")
                     else:
                         # Время еще не пришло - возвращаем в очередь
                         self.redis_client.lpush('retry_tasks', task_data)
@@ -438,6 +817,7 @@ class TaskWorker:
             
             if command['command'] == 'reload_settings':
                 logger.info("🔄 Получена команда обновления настроек")
+                await self._update_cached_settings()
                 logger.info("✅ Настройки обновлены")
                 
         except Exception as e:
@@ -501,13 +881,26 @@ class TaskWorker:
                 ready_count = sum(1 for task in self.task_buffer if task.get('execute_at', 0) <= current_time)
                 future_count = buffer_size - ready_count
                 
+                # Статистика задержек для подписок
+                subscription_delays = []
+                for task in self.task_buffer:
+                    if task.get('task_type') == 'subscribe':
+                        created_at = task.get('created_at', current_time)
+                        execute_at = task.get('execute_at', current_time)
+                        delay_minutes = (execute_at - created_at) / 60
+                        subscription_delays.append(delay_minutes)
+                
+                avg_sub_delay = sum(subscription_delays) / len(subscription_delays) if subscription_delays else 0
+                
                 logger.info(f"""
-📋 БУФЕР ЗАДАЧ:
+📋 БУФЕР ЗАДАЧ (1500):
    📊 Всего в буфере: {buffer_size}/{self.max_buffer_size}
    👀 Просмотров: {view_count}
    📺 Подписок: {sub_count}
    ✅ Готовых к выполнению: {ready_count}
    ⏳ Будущих: {future_count}
+   🔄 Актуализация: {'В процессе' if self.buffer_updating else 'Готов'}
+   ⏰ Средняя задержка подписок: {avg_sub_delay:.1f} мин
                 """)
             else:
                 logger.info("📋 БУФЕР ЗАДАЧ: пустой")
@@ -539,13 +932,14 @@ class TaskWorker:
                     performance_status = "❌ НИЗКО"
                 
                 logger.info(f"""
-📊  СТАТИСТИКА (5 мин):
+📊 СТАТИСТИКА ПРОИЗВОДИТЕЛЬНОСТИ (5 мин):
    ✅ Выполнено задач: {self.processed_tasks} ({tasks_per_min:.1f}/мин)
    📋 В буфере: {len(self.task_buffer)}/{self.max_buffer_size}
    📦 В Redis: {total_in_redis}
    🔄 Retry: {retry_count}
    🧠 Сессий: {session_stats['connected']}/{session_stats['total_loaded']}
    🚀 Производительность: {performance_status}
+   ⚙️ Актуализация: {'Активна' if self.buffer_updating else 'Готова'}
                 """)
             else:
                 logger.info("⏳ Воркер активен, ожидаю загрузки аккаунтов...")
@@ -570,7 +964,8 @@ class TaskWorker:
                 'subscription_tasks': sub_count,
                 'ready_tasks': ready_count,
                 'future_tasks': buffer_size - ready_count,
-                'last_buffer_load': self.last_buffer_load
+                'last_buffer_load': self.last_buffer_load,
+                'buffer_updating': self.buffer_updating
             }
             
         except Exception as e:
@@ -586,6 +981,8 @@ class TaskWorker:
             
             if self.sessions_loaded:
                 logger.info("✅ Сессии успешно перезагружены")
+                # Очищаем буфер от задач с неактивными сессиями
+                asyncio.create_task(self._cleanup_buffer_dead_sessions())
                 return True
             else:
                 logger.warning("⚠️ Сессии не загружены после перезагрузки")
@@ -598,20 +995,25 @@ class TaskWorker:
     async def clear_task_buffer(self):
         """Очищает буфер задач (для экстренных случаев)"""
         logger.info("🗑️ Очистка буфера задач...")
-        cleared_count = len(self.task_buffer)
-        self.task_buffer.clear()
-        logger.info(f"✅ Очищено {cleared_count} задач из буфера")
+        async with self.buffer_lock:
+            cleared_count = len(self.task_buffer)
+            self.task_buffer.clear()
+            logger.info(f"✅ Очищено {cleared_count} задач из буфера")
     
     async def stop(self):
         """Остановка воркера"""
-        logger.info("⏹️ Остановка  воркера...")
+        logger.info("⏹️ Остановка воркера...")
         self.running = False
     
     async def _shutdown(self):
         """Корректное завершение работы"""
-        logger.info("🔄 Завершение работы  воркера...")
+        logger.info("🔄 Завершение работы улучшенного воркера...")
         
         try:
+            # Ждем завершения актуализации буфера
+            while self.buffer_updating:
+                await asyncio.sleep(0.1)
+            
             # Сохраняем задачи из буфера обратно в Redis перед завершением
             if self.task_buffer:
                 logger.info(f"💾 Сохранение {len(self.task_buffer)} задач из буфера в Redis...")
@@ -619,7 +1021,9 @@ class TaskWorker:
                 tasks_data = {}
                 for task in self.task_buffer:
                     try:
-                        task_json = json.dumps(task)
+                        # Удаляем временные поля перед сохранением
+                        clean_task = {k: v for k, v in task.items() if k != 'score'}
+                        task_json = json.dumps(clean_task)
                         execute_at = task.get('execute_at', time.time())
                         tasks_data[task_json] = execute_at
                     except Exception as e:
@@ -636,7 +1040,10 @@ class TaskWorker:
             if self.redis_client:
                 self.redis_client.close()
             
-            logger.info("✅ Воркер корректно завершен")
+            # Закрываем БД
+            await shutdown_db_pool()
+            
+            logger.info("✅ Улучшенный воркер корректно завершен")
             
         except Exception as e:
             logger.error(f"Ошибка при завершении: {e}")
@@ -664,5 +1071,5 @@ if __name__ == "__main__":
     except ImportError:
         logger.info("⚠️ uvloop недоступен, используем стандартный event loop")
     
-    # Запускаем  воркер
+    # Запускаем воркер
     asyncio.run(main())

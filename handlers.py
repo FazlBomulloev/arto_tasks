@@ -293,7 +293,7 @@ async def add_channel_process(message: Message, state: FSMContext):
         await message.delete()
         
         if success:
-            # Создаем задачи подписки для ПРОСТОЙ СИСТЕМЫ
+            # Создаем задачи подписки
             try:
                 results = await task_service.create_subscription_tasks(channel_name, lang)
                 
@@ -305,7 +305,7 @@ async def add_channel_process(message: Message, state: FSMContext):
                     f"✅ <b>Канал @{channel_name} добавлен!</b>\n\n"
                     f"📊 Создано задач подписки: {results['total_tasks']}\n"
                     f"👥 Аккаунтов задействовано: {results['accounts_processed']}\n\n"
-                    f"🔄 Подписки выполняются в фоне с умными задержками\n",
+                    f"🔄 Подписки выполняются в фоне\n",
                     parse_mode='HTML',
                     reply_markup=keyboard
                 )
@@ -555,8 +555,7 @@ async def process_accounts_with_choice(call: CallbackQuery, state: FSMContext):
             f"⏭️ Уже было: {results.get('skipped_exists', 0)}\n"
             f"❌ Не удалось: {results.get('failed_validation', 0) + results.get('failed_db', 0)}\n"
             f"📈 Успешность: {success_rate:.1f}%\n\n"
-            f"{'🔍 Все аккаунты проверены и готовы' if validate else '⚡ Аккаунты добавлены, проверка при выполнении задач'}\n"
-            f"📋 Задачи создаются в простой очереди task_queue",
+            f"{'🔍 Все аккаунты проверены и готовы' if validate else '⚡ Аккаунты добавлены, проверка при выполнении задач'}\n",
             parse_mode='HTML',
             reply_markup=keyboard
         )
@@ -812,7 +811,7 @@ async def settings_menu(call: CallbackQuery):
             [IKB(text='🔙 НАЗАД', callback_data='main_menu')]
         ])
         
-        text = f"""<b>⚙️ НАСТРОЙКИ ПРОСТОЙ СИСТЕМЫ</b>
+        text = f"""<b>⚙️ НАСТРОЙКИ СИСТЕМЫ</b>
 
 <b>👀 ПРОСМОТРЫ:</b>
 ⏰ Период: {settings['view_period']} час ✅ ЖИВАЯ
@@ -824,8 +823,6 @@ async def settings_menu(call: CallbackQuery):
 ⏳ Между аккаунтами: {settings['accounts_delay']} мин ✅ ЖИВАЯ
 🔢 Подписок до паузы: {settings['timeout_count']}
 ⏸️ Длительность паузы: {settings['timeout_duration']} мин ✅ ЖИВАЯ
-
-📋 <b>Очередь:</b> task_queue (простая система)
 💡 <i>Настройки с ✅ применяются сразу к новым задачам</i>"""
         
         await call.message.edit_text(text, parse_mode='HTML', reply_markup=keyboard)
@@ -868,7 +865,6 @@ async def force_settings_reload(call: CallbackQuery):
             "✅ <b>Настройки обновлены!</b>\n\n"
             "🔄 Воркер получил сигнал обновления\n"
             "📊 Новые настройки применятся к следующим задачам\n\n"
-            "📋 <b>Простая система:</b>\n"
             "• Все задачи в одной очереди task_queue\n"
             "• Воркер загружает до 3000 задач в память\n"
             "• Настройки применяются мгновенно",
@@ -943,7 +939,7 @@ async def setting_change_process(message: Message, state: FSMContext):
         await message.answer(
             f"✅ <b>Настройка обновлена</b>\n\n"
             f"📝 {setting_name}: <b>{new_value}</b>\n"
-            f"📋 Простая система: настройка применится к новым задачам",
+            f"📋 настройка применится к новым задачам",
             parse_mode='HTML',
             reply_markup=keyboard
         )
@@ -959,12 +955,12 @@ async def setting_change_process(message: Message, state: FSMContext):
 
 @stats_router.callback_query(F.data == 'statistics')
 async def statistics_menu(call: CallbackQuery):
-    """Меню статистики для простой системы"""
+    """Меню статистики"""
     try:
         # Статистика аккаунтов
         account_stats = await get_account_stats()
         
-        # Статистика задач из простой очереди
+        
         task_stats = await task_service.get_task_stats()
         
         # Статистика сессий
@@ -1076,7 +1072,7 @@ async def handle_channel_post(message: Message):
         
         if results['total_tasks'] > 0:
             logger.info(f"""
-✅ Задачи просмотра созданы (простая система):
+✅ Задачи просмотра созданы:
    📱 Задач: {results['total_tasks']}
    🌐 Языков: {results['languages']}
             """)
