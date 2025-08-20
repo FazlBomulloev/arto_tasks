@@ -28,7 +28,7 @@ class TaskItem:
     execute_at: Optional[float] = None
     retry_count: int = 0
 
-class SimpleTaskService:
+class TaskService:
     def __init__(self):
         self.redis_client = None
         self._init_redis()
@@ -201,7 +201,7 @@ class SimpleTaskService:
             raise TaskProcessingError(f"Failed to schedule tasks: {e}")
     
     async def create_subscription_tasks(self, channel_name: str, target_lang: str) -> Dict[str, int]:
-
+        """Создает задачи подписки с правильной последовательной логикой"""
         results = {
             'total_tasks': 0,
             'accounts_processed': 0
@@ -218,19 +218,54 @@ class SimpleTaskService:
             
             results['accounts_processed'] = len(accounts)
             
-            # Получаем параметры задержек
-            params = await self._get_subscription_delays()
+            # Получаем параметры задержек из настроек
+            base_delay = read_setting('lag.txt', 14.0) * 60  # в секундах
+            range_val = read_setting('range.txt', 5.0) * 60  # в секундах
+            timeout_count = int(read_setting('timeout_count.txt', 3.0))
+            timeout_duration = read_setting('timeout_duration.txt', 13.0) * 60  # в секундах
             
-            # Перемешиваем аккаунты
+            logger.info(f"""
+📺 СОЗДАНИЕ ЗАДАЧ ПОДПИСКИ ДЛЯ @{channel_name}:
+   📱 Аккаунтов: {len(accounts)}
+   🌐 Язык: {target_lang}
+   ⏰ Базовая задержка: {base_delay/60:.1f} мин
+   🎲 Разброс: ±{range_val/60:.1f} мин
+   🔢 Подписок до паузы: {timeout_count}
+   ⏸️ Длительность паузы: {timeout_duration/60:.1f} мин
+            """)
+            
+            # Перемешиваем аккаунты для равномерности
             random.shuffle(accounts)
             
-            # Создаем задачи с рассчитанными задержками
+            # Создаем задачи с ПРАВИЛЬНОЙ последовательной логикой
             subscription_tasks = []
             current_time = time.time()
             
+            # Время выполнения для первого аккаунта = сразу
+            next_execute_time = current_time
+            
             for account_idx, account in enumerate(accounts):
-                delay_seconds = await self._calculate_subscription_delay(account_idx, params)
-                execute_at = current_time + delay_seconds
+                # Рассчитываем execute_at для текущего аккаунта
+                if account_idx == 0:
+                    # Первый аккаунт - сразу
+                    execute_at = next_execute_time
+                else:
+                    # Проверяем нужна ли дополнительная пауза
+                    if account_idx % timeout_count == 0:
+                        # После каждых timeout_count подписок добавляем паузу
+                        pause_delay = timeout_duration
+                        logger.debug(f"⏸️ Пауза {timeout_duration/60:.1f} мин после {account_idx} подписок")
+                    else:
+                        pause_delay = 0
+                    
+                    # Базовая задержка + разброс + возможная пауза
+                    random_variation = random.uniform(-range_val, range_val)
+                    total_delay = base_delay + random_variation + pause_delay
+                    
+                    execute_at = next_execute_time + total_delay
+                
+                # Обновляем время для следующего аккаунта
+                next_execute_time = execute_at
                 
                 task = TaskItem(
                     account_session=account['session_data'],
@@ -242,56 +277,37 @@ class SimpleTaskService:
                 )
                 
                 subscription_tasks.append(task)
+                
+                # Логируем для отладки первых 5 задач
+                if account_idx < 5:
+                    delay_from_start = (execute_at - current_time) / 60
+                    logger.debug(f"📋 {account['phone_number']}: через {delay_from_start:.1f} мин")
             
             results['total_tasks'] = len(subscription_tasks)
             
             # Планируем в ту же очередь что и просмотры
             await self._schedule_subscription_tasks_simple(subscription_tasks)
             
-            logger.info(f"""
+            # Статистика времени
+            if subscription_tasks:
+                first_time = min(task.execute_at for task in subscription_tasks)
+                last_time = max(task.execute_at for task in subscription_tasks)
+                duration_hours = (last_time - first_time) / 3600
+                
+                logger.info(f"""
 ✅ Создано {results['total_tasks']} задач подписки:
    📺 Канал: @{channel_name}
    📱 Аккаунтов: {results['accounts_processed']}
-            """)
+   ⏰ Первая подписка: сразу
+   🕐 Последняя подписка: через {duration_hours:.1f} часов
+   📊 Общая длительность: {duration_hours:.1f} часов
+                """)
             
             return results
             
         except Exception as e:
             logger.error(f"💥 Ошибка создания задач подписки: {e}")
             raise TaskProcessingError(f"Failed to create subscription tasks: {e}")
-    
-    async def _get_subscription_delays(self) -> Dict[str, float]:
-        """Получает параметры задержек подписок"""
-        return {
-            'base_delay': read_setting('lag.txt', 30.0) * 60,
-            'range_val': read_setting('range.txt', 5.0) * 60,
-            'accounts_delay': read_setting('accounts_delay.txt', 10.0) * 60,
-            'timeout_count': int(read_setting('timeout_count.txt', 4.0)),
-            'timeout_duration': read_setting('timeout_duration.txt', 20.0) * 60
-        }
-    
-    async def _calculate_subscription_delay(self, account_index: int, params: Dict[str, float]) -> float:
-        """Рассчитывает задержку для подписки"""
-        base_delay = params['base_delay']
-        range_val = params['range_val']
-        accounts_delay = params['accounts_delay']
-        timeout_count = params['timeout_count']
-        timeout_duration = params['timeout_duration']
-        
-        # Базовая задержка между аккаунтами
-        account_delay = account_index * accounts_delay
-        
-        # Случайный разброс
-        random_variation = random.uniform(-range_val, range_val)
-        
-        # Паузы после каждых timeout_count подписок
-        timeout_cycles = account_index // timeout_count
-        timeout_delay = timeout_cycles * timeout_duration
-        
-        total_delay = account_delay + random_variation + timeout_delay
-        total_delay = max(total_delay, base_delay)
-        
-        return total_delay
     
     async def _schedule_subscription_tasks_simple(self, tasks: List[TaskItem]):
         """Планирует задачи подписки в общую очередь"""
@@ -315,6 +331,9 @@ class SimpleTaskService:
             # Добавляем в ту же очередь что и просмотры
             if tasks_data:
                 self.redis_client.zadd("task_queue", tasks_data)
+                
+                # TTL на 48 часов
+                self.redis_client.expire("task_queue", 48 * 3600)
                 
                 logger.info(f"📋 Добавлено {len(tasks)} задач подписки в task_queue")
             
@@ -352,4 +371,4 @@ class SimpleTaskService:
             return {}
 
 # Глобальный экземпляр 
-task_service = SimpleTaskService()
+task_service = TaskService()

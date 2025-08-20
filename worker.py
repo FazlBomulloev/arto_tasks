@@ -693,7 +693,6 @@ class TaskWorker:
             return False
 
     async def _execute_subscription_task(self, task: Dict) -> bool:
-        """🆕 Выполняет задачу подписки с правильными задержками"""
         session_data = task['account_session']
         phone = task['phone']
         channel = task['channel']
@@ -715,43 +714,74 @@ class TaskWorker:
                 await self._handle_task_failure(phone, 'subscription')
                 return False
             
-            # 🆕 ВАЖНО: Логируем время выполнения подписки для отладки
+            
             created_at = task.get('created_at', 0)
             execute_at = task.get('execute_at', 0)
             current_time = time.time()
             
             actual_delay = (current_time - created_at) / 60  # в минутах
             planned_delay = (execute_at - created_at) / 60   # в минутах
+            execution_drift = (current_time - execute_at) / 60  # отклонение от плана
             
-            logger.info(f"""
+            # Определяем статус выполнения по времени
+            if abs(execution_drift) <= 1.0:
+                timing_status = "⏰ ТОЧНО"
+            elif execution_drift < 0:
+                timing_status = f"🚀 РАНО ({abs(execution_drift):.1f}мин)"
+            else:
+                timing_status = f"⏳ ПОЗДНО (+{execution_drift:.1f}мин)"
+            
+            # Определяем цвет для логирования в зависимости от точности
+            if abs(execution_drift) <= 2.0:
+                log_level = logger.info  # Зеленый - хорошая точность
+            elif abs(execution_drift) <= 5.0:
+                log_level = logger.warning  # Желтый - приемлемое отклонение
+            else:
+                log_level = logger.error  # Красный - большое отклонение
+            
+            log_level(f"""
 📺 ВЫПОЛНЕНИЕ ПОДПИСКИ:
    📱 Аккаунт: {phone}
    📺 Канал: @{channel}
-   ⏰ Планируемая задержка: {planned_delay:.1f} мин
-   🕐 Фактическая задержка: {actual_delay:.1f} мин
-   ⚙️ Настройки: lag={self.cached_settings['sub_lag']/60:.1f}мин, range={self.cached_settings['sub_range']/60:.1f}мин
+   📅 Создана: {time.strftime('%H:%M:%S', time.localtime(created_at))}
+   ⏰ Планировалась: {time.strftime('%H:%M:%S', time.localtime(execute_at))} (через {planned_delay:.1f}мин)
+   🕐 Выполняется: {time.strftime('%H:%M:%S', time.localtime(current_time))} (через {actual_delay:.1f}мин)
+   📊 Статус: {timing_status}
+   ⚙️ Настройки: lag={self.cached_settings.get('sub_lag', 840)/60:.1f}мин, range=±{self.cached_settings.get('sub_range', 300)/60:.1f}мин
             """)
             
             # Выполняем подписку
             await client(JoinChannelRequest(channel_entity))
             
+            # Дополнительная статистика для мониторинга
+            subscription_hour = time.strftime('%H', time.localtime(current_time))
+            logger.debug(f"📊 Подписка в {subscription_hour}:00 | Канал: @{channel} | Отклонение: {execution_drift:.1f}мин")
+            
             # Успех
             await self._handle_task_success(phone)
-            logger.info(f"✅ {phone}: подписан на @{channel} (задержка: {actual_delay:.1f} мин)")
+            
+            # Финальное сообщение с кратким статусом
+            if abs(execution_drift) <= 1.0:
+                logger.info(f"✅ {phone}: подписан на @{channel} | {timing_status}")
+            elif abs(execution_drift) <= 5.0:
+                logger.warning(f"⚠️ {phone}: подписан на @{channel} | {timing_status}")
+            else:
+                logger.error(f"🔥 {phone}: подписан на @{channel} | {timing_status} - ПРОВЕРИТЬ НАСТРОЙКИ!")
+            
             return True
             
         except FloodWaitError as e:
-            logger.warning(f"⏳ {phone}: FloodWait {e.seconds}s при подписке")
+            logger.warning(f"⏳ {phone}: FloodWait {e.seconds}s при подписке на @{channel}")
             await self._add_to_retry_queue(task, 'subscription', delay=e.seconds)
             return False
             
         except (RPCError, AuthKeyInvalidError) as e:
-            logger.warning(f"❌ {phone}: критическая ошибка подписки - {e}")
+            logger.warning(f"❌ {phone}: критическая ошибка подписки на @{channel} - {e}")
             await self._handle_task_failure(phone, 'subscription')
             return False
             
         except Exception as e:
-            logger.error(f"💥 {phone}: неожиданная ошибка подписки - {e}")
+            logger.error(f"💥 {phone}: неожиданная ошибка подписки на @{channel} - {e}")
             await self._handle_task_failure(phone, 'subscription')
             return False
     
