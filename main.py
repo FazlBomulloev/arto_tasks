@@ -7,13 +7,11 @@ from pathlib import Path
 from config import BOT_TOKEN, LOGGING_CONFIG, RUN_WORKER, RUN_BOT, VARS_DIR
 from database import init_db_pool, create_tables, shutdown_db_pool
 from handlers import get_all_routers
-from worker import TaskWorker
+from worker import SimpleTaskWorker
 
 # Настройка логирования
 logging.config.dictConfig(LOGGING_CONFIG)
 logger = logging.getLogger(__name__)
-
-
 
 async def main():
     if not RUN_BOT and not RUN_WORKER:
@@ -26,7 +24,7 @@ async def main():
     if RUN_WORKER:
         mode_description.append("🔧 Воркер")
     
-    logger.info(f"🚀 Запуск: {' + '.join(mode_description)}")
+    logger.info(f"🚀 Запуск: {' + '.join(mode_description)} (Новая схема)")
     
     try:
         # Устанавливаем uvloop если доступен
@@ -69,10 +67,9 @@ async def main():
         
         # Инициализация воркера
         if RUN_WORKER:
-            worker = TaskWorker()
+            worker = SimpleTaskWorker()
             
             async def run_worker():
-                logger.info("🔧 Запуск воркера задач...")
                 await worker.start()
             
             tasks.append(run_worker())
@@ -83,7 +80,7 @@ async def main():
         elif RUN_WORKER and not RUN_BOT:
             logger.info("ℹ️ Запущен только воркер - бот недоступен для управления")
         else:
-            logger.info("✅ Бот и воркер готовы к работе!")
+            logger.info("✅ Бот и воркер готовы к работе в новой схеме!")
         
         # Запускаем все задачи параллельно
         if len(tasks) == 1:
@@ -108,7 +105,7 @@ async def main():
             # Закрываем БД
             await shutdown_db_pool()
             
-            logger.info("✅ Все компоненты корректно остановлены")
+            logger.info("✅ Все компоненты корректно остановлены (новая схема)")
         except Exception as e:
             logger.error(f"Ошибка при остановке: {e}")
 

@@ -41,7 +41,6 @@ from database import (
     get_all_languages, add_language, get_channels_by_lang, add_channel,
     get_account_stats, get_accounts_by_lang
 )
-from session_manager import global_session_manager
 from account_service import account_service
 from task_service import task_service
 from exceptions import AccountValidationError, TaskProcessingError
@@ -111,7 +110,7 @@ async def start_command(message: Message, state: FSMContext):
         "🌐 Управление языками и каналами\n"
         "👥 Управление аккаунтами\n"
         "⚙️ Настройки задержек\n"
-        "📊 Статистика работы",
+        "📊 Статистика работы\n\n",
         parse_mode='HTML',
         reply_markup=keyboard
     )
@@ -141,7 +140,8 @@ async def back_to_main(call: CallbackQuery, state: FSMContext):
         "🌐 Управление языками и каналами\n"
         "👥 Управление аккаунтами\n"
         "⚙️ Настройки задержек\n"
-        "📊 Статистика работы",
+        "📊 Статистика работы\n\n"
+        ,
         parse_mode='HTML',
         reply_markup=keyboard
     )
@@ -246,7 +246,7 @@ async def language_details(call: CallbackQuery):
 🚫 Забанены: {ban_count}
 📱 Всего: {len(accounts)}
 
-{channels_text}"""
+{channels_text} """
         
         await safe_edit_message(
             call.message,
@@ -271,7 +271,8 @@ async def add_channel_start(call: CallbackQuery, state: FSMContext):
     await call.message.edit_text(
         f"<b>➕ ДОБАВЛЕНИЕ КАНАЛА</b>\n\n"
         f"Язык: <b>{lang}</b>\n\n"
-        f"📝 Отправьте имя канала без @ (например: <code>mychannel</code>)",
+        f"📝 Отправьте имя канала без @ (например: <code>mychannel</code>)\n\n"
+        f"⚡ После добавления будут созданы задачи подписки для всех аккаунтов языка",
         parse_mode='HTML',
         reply_markup=keyboard
     )
@@ -304,8 +305,7 @@ async def add_channel_process(message: Message, state: FSMContext):
                 await message.answer(
                     f"✅ <b>Канал @{channel_name} добавлен!</b>\n\n"
                     f"📊 Создано задач подписки: {results['total_tasks']}\n"
-                    f"👥 Аккаунтов задействовано: {results['accounts_processed']}\n\n"
-                    f"🔄 Подписки выполняются в фоне\n",
+                    f"👥 Аккаунтов задействовано: {results['accounts_processed']}\n\n",
                     parse_mode='HTML',
                     reply_markup=keyboard
                 )
@@ -374,293 +374,6 @@ async def delete_channel_execute(call: CallbackQuery):
         
     except Exception as e:
         logger.error(f"Ошибка удаления канала: {e}")
-        await call.answer("❌ Произошла ошибка при удалении", show_alert=True)
-
-# === УПРАВЛЕНИЕ АККАУНТАМИ ===
-
-@account_router.callback_query(F.data == 'accounts')
-async def accounts_menu(call: CallbackQuery):
-    """Главное меню аккаунтов"""
-    try:
-        stats = await get_account_stats()
-        
-        keyboard = IKM(inline_keyboard=[
-            [IKB(text='📊 СТАТИСТИКА', callback_data='account_stats')],
-            [IKB(text='🗑️ УДАЛИТЬ ПО СТАТУСУ', callback_data='delete_by_status')],
-            [IKB(text='📤 ЭКСПОРТ АКТИВНЫХ', callback_data='export_all_active')],
-            [IKB(text='🔄 СТАТУС СЕССИЙ', callback_data='session_status')],
-            [IKB(text='🔙 НАЗАД', callback_data='main_menu')]
-        ])
-        
-        text = f"""<b>👥 УПРАВЛЕНИЕ АККАУНТАМИ</b>
-
-<b>📊 Общая статистика:</b>
-📱 Всего аккаунтов: {stats.get('total', 0)}
-✅ Активных: {stats.get('active', 0)}
-⏸️ На паузе: {stats.get('pause', 0)}
-🚫 Забанены: {stats.get('ban', 0)}
-
-<b>🧠 Статус сессий:</b>
-💾 Загружено в RAM: {len(global_session_manager.clients)}
-🔄 Статус загрузки: {'✅ Завершена' if global_session_manager.loading_complete else '⏳ В процессе'}"""
-        
-        await safe_edit_message(
-            call.message,
-            text,
-            parse_mode='HTML',
-            reply_markup=keyboard
-        )
-        
-    except Exception as e:
-        logger.error(f"Ошибка меню аккаунтов: {e}")
-        await call.answer("❌ Произошла ошибка", show_alert=True)
-
-@account_router.callback_query(F.data.startswith('add_accounts:'))
-async def add_accounts_start(call: CallbackQuery, state: FSMContext):
-    """Начало добавления аккаунтов"""
-    lang = call.data.split(':', 1)[1]
-    
-    keyboard = IKM(inline_keyboard=[
-        [IKB(text='🔙 НАЗАД', callback_data=f'lang:{lang}')]
-    ])
-    
-    await call.message.edit_text(
-        f"<b>➕ ДОБАВЛЕНИЕ АККАУНТОВ</b>\n\n"
-        f"Язык: <b>{lang}</b>\n\n"
-        f"📦 Отправьте ZIP архив с аккаунтами\n"
-        f"🔐 Каждый аккаунт будет проверен на авторизацию\n"
-        f"⚠️ Процесс может занять время",
-        parse_mode='HTML',
-        reply_markup=keyboard
-    )
-    
-    await state.set_state(BotStates.waiting_zip_file)
-    await state.update_data(lang=lang, message_id=call.message.message_id)
-
-@account_router.message(BotStates.waiting_zip_file)
-async def add_accounts_process(message: Message, state: FSMContext):
-    """Обработка ZIP файла с аккаунтами"""
-    try:
-        if not message.document or not message.document.file_name.lower().endswith('.zip'):
-            await message.answer("❌ Отправьте ZIP файл")
-            return
-        
-        data = await state.get_data()
-        lang = data['lang']
-        
-        # Скачиваем файл
-        file_info = await message.bot.get_file(message.document.file_id)
-        zip_path = Path(f"downloads/upload_{int(asyncio.get_event_loop().time())}.zip")
-        zip_path.parent.mkdir(exist_ok=True)
-        
-        await message.bot.download_file(file_info.file_path, zip_path)
-        await message.delete()
-        
-        # СПРАШИВАЕМ О ПРОВЕРКЕ АККАУНТОВ
-        keyboard = IKM(inline_keyboard=[
-            [IKB(text='✅ ДА, ПРОВЕРИТЬ', callback_data=f'validate_accounts:{lang}:true')],
-            [IKB(text='⚡ НЕТ, БЫСТРО ДОБАВИТЬ', callback_data=f'validate_accounts:{lang}:false')],
-            [IKB(text='❌ ОТМЕНА', callback_data=f'lang:{lang}')]
-        ])
-        
-        await message.answer(
-            f"<b>🔍 ПРОВЕРКА АККАУНТОВ</b>\n\n"
-            f"Язык: <b>{lang}</b>\n"
-            f"Архив: <b>{message.document.file_name}</b>\n\n"
-            f"<b>Выберите режим обработки:</b>\n\n"
-            f"✅ <b>С ПРОВЕРКОЙ</b> - медленно, но надежно:\n"
-            f"⚡ <b>БЫСТРОЕ ДОБАВЛЕНИЕ</b> - мгновенно:\n",
-            parse_mode='HTML',
-            reply_markup=keyboard
-        )
-        
-        # Сохраняем путь к файлу в состоянии
-        await state.update_data(zip_path=str(zip_path))
-        
-    except Exception as e:
-        logger.error(f"Ошибка обработки ZIP: {e}")
-        await message.answer("❌ Произошла ошибка при обработке файла")
-        await state.clear()
-
-@account_router.callback_query(F.data.startswith('validate_accounts:'))
-async def process_accounts_with_choice(call: CallbackQuery, state: FSMContext):
-    """Обработка аккаунтов в выбранном режиме"""
-    try:
-        _, lang, validate_str = call.data.split(':', 2)
-        validate = validate_str.lower() == 'true'
-        
-        data = await state.get_data()
-        zip_path = Path(data['zip_path'])
-        
-        if not zip_path.exists():
-            await call.answer("❌ Файл не найден", show_alert=True)
-            return
-        
-        if validate:
-            # РЕЖИМ С ПРОВЕРКОЙ (медленный)
-            progress_msg = await call.message.edit_text(
-                "🔄 <b>Режим с проверкой</b>\n"
-                "📦 Извлекаю архив...",
-                parse_mode='HTML'
-            )
-            
-            async def update_progress(text):
-                try:
-                    await progress_msg.edit_text(f"🔄 <b>Режим с проверкой</b>\n{text}", parse_mode='HTML')
-                except:
-                    pass
-            
-            # Используем метод с валидацией
-            results = await account_service.add_accounts_from_zip(
-                zip_path, lang, update_progress
-            )
-            
-        else:
-            # РЕЖИМ БЫСТРОГО ДОБАВЛЕНИЯ (новый)
-            progress_msg = await call.message.edit_text(
-                "⚡ <b>Быстрое добавление</b>\n"
-                "📦 Извлекаю архив...",
-                parse_mode='HTML'
-            )
-            
-            async def update_progress(text):
-                try:
-                    await progress_msg.edit_text(f"⚡ <b>Быстрое добавление</b>\n{text}", parse_mode='HTML')
-                except:
-                    pass
-            
-            # Используем метод без валидации
-            results = await account_service.add_accounts_from_zip_fast(
-                zip_path, lang, update_progress
-            )
-        
-        # Удаляем временный файл
-        if zip_path.exists():
-            zip_path.unlink()
-        
-        # Показываем результаты
-        success_rate = (results['added'] / results['total']) * 100 if results['total'] > 0 else 0
-        
-        keyboard = IKM(inline_keyboard=[
-            [IKB(text='🔙 К ЯЗЫКУ', callback_data=f'lang:{lang}')]
-        ])
-        
-        mode_text = "с проверкой" if validate else "быстрое"
-        
-        await progress_msg.edit_text(
-            f"✅ <b>Добавление {mode_text} завершено!</b>\n\n"
-            f"📊 <b>Результаты:</b>\n"
-            f"📱 Всего аккаунтов: {results['total']}\n"
-            f"➕ Добавлено: {results['added']}\n"
-            f"⏭️ Уже было: {results.get('skipped_exists', 0)}\n"
-            f"❌ Не удалось: {results.get('failed_validation', 0) + results.get('failed_db', 0)}\n"
-            f"📈 Успешность: {success_rate:.1f}%\n\n"
-            f"{'🔍 Все аккаунты проверены и готовы' if validate else '⚡ Аккаунты добавлены, проверка при выполнении задач'}\n",
-            parse_mode='HTML',
-            reply_markup=keyboard
-        )
-        
-        await state.clear()
-        
-    except Exception as e:
-        logger.error(f"Ошибка обработки аккаунтов: {e}")
-        await call.answer("❌ Произошла ошибка", show_alert=True)
-        await state.clear()
-
-@account_router.callback_query(F.data == 'delete_by_status')
-async def delete_by_status_menu(call: CallbackQuery):
-    """Меню удаления по статусу"""
-    keyboard = IKM(inline_keyboard=[
-        [IKB(text='🚫 УДАЛИТЬ ЗАБАНЕННЫХ', callback_data='delete_status:ban')],
-        [IKB(text='⏸️ УДАЛИТЬ НА ПАУЗЕ', callback_data='delete_status:pause')],
-        [IKB(text='🗑️ УДАЛИТЬ ВСЕ', callback_data='delete_status:all')],
-        [IKB(text='🔙 НАЗАД', callback_data='accounts')]
-    ])
-    
-    await call.message.edit_text(
-        "<b>🗑️ УДАЛЕНИЕ АККАУНТОВ ПО СТАТУСУ</b>\n\n"
-        "⚠️ <b>ВНИМАНИЕ:</b> Удаление необратимо!\n"
-        "Аккаунты будут полностью удалены из базы данных.",
-        parse_mode='HTML',
-        reply_markup=keyboard
-    )
-
-@account_router.callback_query(F.data.startswith('delete_status:'))
-async def delete_by_status_confirm(call: CallbackQuery):
-    """Подтверждение удаления по статусу"""
-    status = call.data.split(':', 1)[1]
-    
-    # Получаем количество для удаления
-    try:
-        if status == 'all':
-            stats = await get_account_stats()
-            count = stats.get('total', 0)
-            status_text = "ВСЕХ"
-        else:
-            stats = await get_account_stats()
-            count = stats.get(status, 0)
-            status_text = {
-                'ban': 'ЗАБАНЕННЫХ',
-                'pause': 'НА ПАУЗЕ'
-            }.get(status, status.upper())
-        
-        if count == 0:
-            await call.answer(f"❌ Нет аккаунтов со статусом '{status}'", show_alert=True)
-            return
-        
-        keyboard = IKM(inline_keyboard=[
-            [IKB(text='✅ ДА, УДАЛИТЬ', callback_data=f'confirm_delete:{status}')],
-            [IKB(text='❌ ОТМЕНА', callback_data='delete_by_status')]
-        ])
-        
-        await call.message.edit_text(
-            f"⚠️ <b>ПОДТВЕРЖДЕНИЕ УДАЛЕНИЯ</b>\n\n"
-            f"Вы точно хотите удалить <b>{count}</b> {status_text} аккаунтов?\n\n"
-            f"🚨 Это действие <b>НЕОБРАТИМО</b>!",
-            parse_mode='HTML',
-            reply_markup=keyboard
-        )
-        
-    except Exception as e:
-        logger.error(f"Ошибка подтверждения удаления: {e}")
-        await call.answer("❌ Произошла ошибка", show_alert=True)
-
-@account_router.callback_query(F.data.startswith('confirm_delete:'))
-async def delete_by_status_execute(call: CallbackQuery):
-    """Выполнение удаления по статусу"""
-    status = call.data.split(':', 1)[1]
-    
-    try:
-        progress_msg = await call.message.edit_text(
-            "🔄 <b>Удаление аккаунтов...</b>\n⏳ Пожалуйста, подождите...",
-            parse_mode='HTML'
-        )
-        
-        # Выполняем удаление
-        deleted_count = await account_service.delete_accounts_by_status(status)
-        
-        keyboard = IKM(inline_keyboard=[
-            [IKB(text='🔙 НАЗАД', callback_data='accounts')]
-        ])
-        
-        if deleted_count > 0:
-            await progress_msg.edit_text(
-                f"✅ <b>Удаление завершено</b>\n\n"
-                f"🗑️ Удалено аккаунтов: {deleted_count}\n"
-                f"🧠 Сессии очищены из памяти",
-                parse_mode='HTML',
-                reply_markup=keyboard
-            )
-        else:
-            await progress_msg.edit_text(
-                "❌ <b>Ничего не удалено</b>\n\n"
-                "Возможно, аккаунты с таким статусом не найдены",
-                parse_mode='HTML',
-                reply_markup=keyboard
-            )
-        
-    except Exception as e:
-        logger.error(f"Ошибка удаления аккаунтов: {e}")
         await call.answer("❌ Произошла ошибка при удалении", show_alert=True)
 
 @account_router.callback_query(F.data.startswith('export_accounts:'))
@@ -741,47 +454,274 @@ async def export_all_accounts(call: CallbackQuery):
         logger.error(f"Ошибка экспорта всех аккаунтов: {e}")
         await call.answer("❌ Произошла ошибка при создании архива", show_alert=True)
 
-@account_router.callback_query(F.data == 'session_status')
-async def session_status(call: CallbackQuery):
-    """Статус пула сессий"""
+
+# === УПРАВЛЕНИЕ АККАУНТАМИ ===
+@account_router.callback_query(F.data == 'accounts')
+async def accounts_menu(call: CallbackQuery):
+    """Главное меню аккаунтов"""
     try:
-        stats = await global_session_manager.get_stats()
-        current_time = time.strftime("%H:%M:%S")
+        stats = await get_account_stats()
         
         keyboard = IKM(inline_keyboard=[
-            [IKB(text='🔄 ОБНОВИТЬ', callback_data='session_status_refresh')],
-            [IKB(text='🔙 НАЗАД', callback_data='accounts')]
+            [IKB(text='🗑️ УДАЛИТЬ ПО СТАТУСУ', callback_data='delete_by_status')],
+            [IKB(text='📤 ЭКСПОРТ АКТИВНЫХ', callback_data='export_all_active')],
+            [IKB(text='🔙 НАЗАД', callback_data='main_menu')]
         ])
         
-        text = f"""<b>🧠 СТАТУС ПУЛА СЕССИЙ</b> <i>({current_time})</i>
+        text = f"""<b>👥 УПРАВЛЕНИЕ АККАУНТАМИ</b>
 
-<b>📊 Общая информация:</b>
-💾 Загружено в RAM: {stats['total_loaded']}
-🟢 Подключены: {stats['connected']}
-🔴 Отключены: {stats['disconnected']}
-❌ Неудачных: {stats['failed']}
-
-<b>⚙️ Status:</b>
-🔄 Загрузка завершена: {'✅ Да' if stats['loading_complete'] else '❌ Нет'}
-💾 Потребление RAM: ~{stats['memory_usage_mb']:.1f} МБ
-
-<b>🎯 Эффективность:</b>
-📈 Готовность: {(stats['connected']/max(stats['total_loaded'], 1)*100):.1f}%"""
+<b>📊 Общая статистика:</b>
+📱 Всего аккаунтов: {stats.get('total', 0)}
+✅ Активных: {stats.get('active', 0)}
+⏸️ На паузе: {stats.get('pause', 0)}
+🚫 Забанены: {stats.get('ban', 0)}
+"""
         
-        await call.message.edit_text(
+        await safe_edit_message(
+            call.message,
             text,
             parse_mode='HTML',
             reply_markup=keyboard
         )
         
     except Exception as e:
-        logger.error(f"Ошибка статуса сессий: {e}")
+        logger.error(f"Ошибка меню аккаунтов: {e}")
         await call.answer("❌ Произошла ошибка", show_alert=True)
 
-@account_router.callback_query(F.data == 'session_status_refresh')
-async def session_status_refresh(call: CallbackQuery):
-    """Обновление статуса сессий"""
-    await session_status(call)
+@account_router.callback_query(F.data.startswith('add_accounts:'))
+async def add_accounts_start(call: CallbackQuery, state: FSMContext):
+    """Начало добавления аккаунтов"""
+    lang = call.data.split(':', 1)[1]
+    
+    keyboard = IKM(inline_keyboard=[
+        [IKB(text='🔙 НАЗАД', callback_data=f'lang:{lang}')]
+    ])
+    
+    await call.message.edit_text(
+        f"<b>➕ ДОБАВЛЕНИЕ АККАУНТОВ</b>\n\n"
+        f"Язык: <b>{lang}</b>\n\n"
+        f"📦 Отправьте ZIP архив с аккаунтами\n\n"
+        f"• Выберете режим проверки\n"
+        f"• Быстрое добавление или с валидацией\n",
+        parse_mode='HTML',
+        reply_markup=keyboard
+    )
+    
+    await state.set_state(BotStates.waiting_zip_file)
+    await state.update_data(lang=lang, message_id=call.message.message_id)
+
+@account_router.message(BotStates.waiting_zip_file)
+async def add_accounts_process(message: Message, state: FSMContext):
+    """Обработка ZIP файла с аккаунтами"""
+    try:
+        if not message.document or not message.document.file_name.lower().endswith('.zip'):
+            await message.answer("❌ Отправьте ZIP файл")
+            return
+        
+        data = await state.get_data()
+        lang = data['lang']
+        
+        # Скачиваем файл
+        file_info = await message.bot.get_file(message.document.file_id)
+        zip_path = Path(f"downloads/upload_{int(asyncio.get_event_loop().time())}.zip")
+        zip_path.parent.mkdir(exist_ok=True)
+        
+        await message.bot.download_file(file_info.file_path, zip_path)
+        await message.delete()
+        
+        # СПРАШИВАЕМ О РЕЖИМЕ ПРОВЕРКИ
+        keyboard = IKM(inline_keyboard=[
+            [IKB(text='✅ ДА, ПРОВЕРИТЬ', callback_data=f'validate_accounts:{lang}:true')],
+            [IKB(text='⚡ НЕТ, БЫСТРО ДОБАВИТЬ', callback_data=f'validate_accounts:{lang}:false')],
+            [IKB(text='❌ ОТМЕНА', callback_data=f'lang:{lang}')]
+        ])
+        
+        await message.answer(
+            f"<b>🔍 РЕЖИМ ОБРАБОТКИ АККАУНТОВ</b>\n\n"
+            f"Язык: <b>{lang}</b>\n"
+            f"Архив: <b>{message.document.file_name}</b>\n\n"
+            f"<b>Выберите режим:</b>\n\n"
+            f"✅ <b>С ПРОВЕРКОЙ</b> - медленно, но надежно:\n"
+            f"   • Подключение к каждому аккаунту\n"
+            f"   • Проверка авторизации\n"
+            f"   • Только рабочие аккаунты в БД\n\n"
+            f"⚡ <b>БЫСТРОЕ ДОБАВЛЕНИЕ</b> - мгновенно:\n"
+            f"   • Конвертация без подключения\n"
+            f"   • Проверка при выполнении задач\n"
+            f"   • Все аккаунты сразу в БД",
+            parse_mode='HTML',
+            reply_markup=keyboard
+        )
+        
+        # Сохраняем путь к файлу в состоянии
+        await state.update_data(zip_path=str(zip_path))
+        
+    except Exception as e:
+        logger.error(f"Ошибка обработки ZIP: {e}")
+        await message.answer("❌ Произошла ошибка при обработке файла")
+        await state.clear()
+
+@account_router.callback_query(F.data.startswith('validate_accounts:'))
+async def process_accounts_with_choice(call: CallbackQuery, state: FSMContext):
+    """Обработка аккаунтов в выбранном режиме"""
+    try:
+        _, lang, validate_str = call.data.split(':', 2)
+        validate_accounts = validate_str.lower() == 'true'
+        
+        data = await state.get_data()
+        zip_path = Path(data['zip_path'])
+        
+        if not zip_path.exists():
+            await call.answer("❌ Файл не найден", show_alert=True)
+            return
+        
+        mode_text = "С ПРОВЕРКОЙ" if validate_accounts else "БЫСТРОЕ ДОБАВЛЕНИЕ"
+        
+        progress_msg = await call.message.edit_text(
+            f"🔄 <b>{mode_text}</b>\n"
+            f"📦 Извлекаю архив...",
+            parse_mode='HTML'
+        )
+        
+        async def update_progress(text):
+            try:
+                await progress_msg.edit_text(f"🔄 <b>{mode_text}</b>\n{text}", parse_mode='HTML')
+            except:
+                pass
+        
+        # Используем новый единый метод с параметром валидации
+        results = await account_service.add_accounts_from_zip(
+            zip_path, lang, validate_accounts, update_progress
+        )
+        
+        # Удаляем временный файл
+        if zip_path.exists():
+            zip_path.unlink()
+        
+        # Показываем результаты
+        success_rate = (results['added'] / results['total']) * 100 if results['total'] > 0 else 0
+        
+        keyboard = IKM(inline_keyboard=[
+            [IKB(text='🔙 К ЯЗЫКУ', callback_data=f'lang:{lang}')]
+        ])
+        
+        validation_text = "Все аккаунты проверены" if validate_accounts else "Проверка при выполнении задач"
+        
+        await progress_msg.edit_text(
+            f"✅ <b>{mode_text} завершено!</b>\n\n"
+            f"📊 <b>Результаты:</b>\n"
+            f"📱 Всего аккаунтов: {results['total']}\n"
+            f"➕ Добавлено: {results['added']}\n"
+            f"⏭️ Уже было: {results.get('skipped_exists', 0)}\n"
+            f"❌ Не удалось: {results.get('failed_validation', 0) + results.get('failed_db', 0)}\n"
+            f"📈 Успешность: {success_rate:.1f}%\n\n"
+            f"⚡ <b>Статус:</b> {validation_text}\n"
+            f"📺 Созданы задачи подписки на все каналы языка",
+            parse_mode='HTML',
+            reply_markup=keyboard
+        )
+        
+        await state.clear()
+        
+    except Exception as e:
+        logger.error(f"Ошибка обработки аккаунтов: {e}")
+        await call.answer("❌ Произошла ошибка", show_alert=True)
+        await state.clear()
+
+@account_router.callback_query(F.data == 'delete_by_status')
+async def delete_by_status_menu(call: CallbackQuery):
+    """Меню удаления по статусу"""
+    keyboard = IKM(inline_keyboard=[
+        [IKB(text='🚫 УДАЛИТЬ ЗАБАНЕННЫХ', callback_data='delete_status:ban')],
+        [IKB(text='⏸️ УДАЛИТЬ НА ПАУЗЕ', callback_data='delete_status:pause')],
+        [IKB(text='🗑️ УДАЛИТЬ ВСЕ', callback_data='delete_status:all')],
+        [IKB(text='🔙 НАЗАД', callback_data='accounts')]
+    ])
+    
+    await call.message.edit_text(
+        "<b>🗑️ УДАЛЕНИЕ АККАУНТОВ ПО СТАТУСУ</b>\n\n"
+        "⚠️ <b>ВНИМАНИЕ:</b> Удаление необратимо!\n"
+        "Аккаунты будут полностью удалены из базы данных.\n\n",
+        parse_mode='HTML',
+        reply_markup=keyboard
+    )
+
+@account_router.callback_query(F.data.startswith('delete_status:'))
+async def delete_by_status_confirm(call: CallbackQuery):
+    """Подтверждение удаления по статусу"""
+    status = call.data.split(':', 1)[1]
+    
+    # Получаем количество для удаления
+    try:
+        if status == 'all':
+            stats = await get_account_stats()
+            count = stats.get('total', 0)
+            status_text = "ВСЕХ"
+        else:
+            stats = await get_account_stats()
+            count = stats.get(status, 0)
+            status_text = {
+                'ban': 'ЗАБАНЕННЫХ',
+                'pause': 'НА ПАУЗЕ'
+            }.get(status, status.upper())
+        
+        if count == 0:
+            await call.answer(f"❌ Нет аккаунтов со статусом '{status}'", show_alert=True)
+            return
+        
+        keyboard = IKM(inline_keyboard=[
+            [IKB(text='✅ ДА, УДАЛИТЬ', callback_data=f'confirm_delete:{status}')],
+            [IKB(text='❌ ОТМЕНА', callback_data='delete_by_status')]
+        ])
+        
+        await call.message.edit_text(
+            f"⚠️ <b>ПОДТВЕРЖДЕНИЕ УДАЛЕНИЯ</b>\n\n"
+            f"Вы точно хотите удалить <b>{count}</b> {status_text} аккаунтов?\n\n"
+            f"🚨 Это действие <b>НЕОБРАТИМО</b>!\n\n",
+            parse_mode='HTML',
+            reply_markup=keyboard
+        )
+        
+    except Exception as e:
+        logger.error(f"Ошибка подтверждения удаления: {e}")
+        await call.answer("❌ Произошла ошибка", show_alert=True)
+
+@account_router.callback_query(F.data.startswith('confirm_delete:'))
+async def delete_by_status_execute(call: CallbackQuery):
+    """Выполнение удаления по статусу"""
+    status = call.data.split(':', 1)[1]
+    
+    try:
+        progress_msg = await call.message.edit_text(
+            "🔄 <b>Удаление аккаунтов...</b>\n⏳ Пожалуйста, подождите...",
+            parse_mode='HTML'
+        )
+        
+        # Выполняем удаление
+        deleted_count = await account_service.delete_accounts_by_status(status)
+        
+        keyboard = IKM(inline_keyboard=[
+            [IKB(text='🔙 НАЗАД', callback_data='accounts')]
+        ])
+        
+        if deleted_count > 0:
+            await progress_msg.edit_text(
+                f"✅ <b>Удаление завершено</b>\n\n"
+                f"🗑️ Удалено аккаунтов: {deleted_count}\n\n",
+                parse_mode='HTML',
+                reply_markup=keyboard
+            )
+        else:
+            await progress_msg.edit_text(
+                "❌ <b>Ничего не удалено</b>\n\n"
+                "Возможно, аккаунты с таким статусом не найдены",
+                parse_mode='HTML',
+                reply_markup=keyboard
+            )
+        
+    except Exception as e:
+        logger.error(f"Ошибка удаления аккаунтов: {e}")
+        await call.answer("❌ Произошла ошибка при удалении", show_alert=True)        
 
 # === НАСТРОЙКИ ===
 @settings_router.callback_query(F.data == 'settings')
@@ -791,20 +731,20 @@ async def settings_menu(call: CallbackQuery):
         # Читаем текущие настройки
         settings = {
             'view_period': read_setting('followPeriod.txt', 1.0),
+            "accounts_delay": read_setting('accounts_delay.txt', 2.0),
             'view_delay': read_setting('delay.txt', 20.0),
             'sub_lag': read_setting('lag.txt', 30.0),
             'sub_range': read_setting('range.txt', 5.0),
-            'accounts_delay': read_setting('accounts_delay.txt', 10.0),
             'timeout_count': int(read_setting('timeout_count.txt', 4.0)),
             'timeout_duration': read_setting('timeout_duration.txt', 20.0)
         }
         
         keyboard = IKM(inline_keyboard=[
             [IKB(text='⏰ ПЕРИОД ПРОСМОТРОВ', callback_data='set:followPeriod.txt')],
-            [IKB(text='🔄 ЗАДЕРЖКА ПРОСМОТРОВ', callback_data='set:delay.txt')],
+            [IKB(text='⏰ МЕЖДУ АККАУНТАМИ', callback_data='set:delay.txt')],
             [IKB(text='📅 ОСНОВНАЯ ПОДПИСКИ', callback_data='set:lag.txt')],
             [IKB(text='🎲 РАЗБРОС ПОДПИСКИ', callback_data='set:range.txt')],
-            [IKB(text='⏳ ЗАДЕРЖКА АККАУНТОВ', callback_data='set:accounts_delay.txt')],
+            [IKB(text='⏰ ЗАДЕРЖКА АККАУНТОВ', callback_data='set:accounts_delay.txt')],
             [IKB(text='🔢 ПОДПИСОК ДО ПАУЗЫ', callback_data='set:timeout_count.txt')],
             [IKB(text='⏸️ ДЛИТЕЛЬНОСТЬ ПАУЗЫ', callback_data='set:timeout_duration.txt')],
             [IKB(text='🔄 ОБНОВИТЬ ВСЕ', callback_data='force_settings_reload')],
@@ -814,16 +754,14 @@ async def settings_menu(call: CallbackQuery):
         text = f"""<b>⚙️ НАСТРОЙКИ СИСТЕМЫ</b>
 
 <b>👀 ПРОСМОТРЫ:</b>
-⏰ Период: {settings['view_period']} час ✅ ЖИВАЯ
-🔄 Задержка: {settings['view_delay']} мин
-
+⏰ Период: {settings['view_period']} час
+⏰ Между аккаунтами: {settings['view_delay']} мин
 <b>📺 ПОДПИСКИ:</b>
 📅 Основная задержка: {settings['sub_lag']} мин
 🎲 Разброс: {settings['sub_range']} мин
-⏳ Между аккаунтами: {settings['accounts_delay']} мин ✅ ЖИВАЯ
+⏰ Задержка аккаунтов: {settings['accounts_delay']} мин
 🔢 Подписок до паузы: {settings['timeout_count']}
-⏸️ Длительность паузы: {settings['timeout_duration']} мин ✅ ЖИВАЯ
-💡 <i>Настройки с ✅ применяются сразу к новым задачам</i>"""
+⏸️ Длительность паузы: {settings['timeout_duration']} мин """
         
         await call.message.edit_text(text, parse_mode='HTML', reply_markup=keyboard)
         
@@ -864,10 +802,7 @@ async def force_settings_reload(call: CallbackQuery):
         await progress_msg.edit_text(
             "✅ <b>Настройки обновлены!</b>\n\n"
             "🔄 Воркер получил сигнал обновления\n"
-            "📊 Новые настройки применятся к следующим задачам\n\n"
-            "• Все задачи в одной очереди task_queue\n"
-            "• Воркер загружает до 3000 задач в память\n"
-            "• Настройки применяются мгновенно",
+            "📊 Новые настройки применятся к следующим задачам\n\n",
             parse_mode='HTML',
             reply_markup=keyboard
         )
@@ -886,7 +821,7 @@ async def setting_change_start(call: CallbackQuery, state: FSMContext):
         'delay.txt': 'Задержка просмотров (минуты)', 
         'lag.txt': 'Основная задержка подписок (минуты)',
         'range.txt': 'Разброс подписок (минуты)',
-        'accounts_delay.txt': 'Задержка между аккаунтами (минуты)',
+        "accounts_delay.txt": 'Задержка аккаунтов (минуты)',
         'timeout_count.txt': 'Количество подписок до паузы',
         'timeout_duration.txt': 'Длительность паузы (минуты)'
     }
@@ -902,7 +837,7 @@ async def setting_change_start(call: CallbackQuery, state: FSMContext):
         f"<b>⚙️ ИЗМЕНЕНИЕ НАСТРОЙКИ</b>\n\n"
         f"📝 Параметр: <b>{setting_name}</b>\n"
         f"🔢 Текущее значение: <b>{current_value}</b>\n\n"
-        f"✏️ Введите новое значение:",
+        f"✏️ Введите новое значение:\n\n",
         parse_mode='HTML',
         reply_markup=keyboard
     )
@@ -938,8 +873,7 @@ async def setting_change_process(message: Message, state: FSMContext):
         await message.delete()
         await message.answer(
             f"✅ <b>Настройка обновлена</b>\n\n"
-            f"📝 {setting_name}: <b>{new_value}</b>\n"
-            f"📋 настройка применится к новым задачам",
+            f"📝 {setting_name}: <b>{new_value}</b>\n\n",
             parse_mode='HTML',
             reply_markup=keyboard
         )
@@ -960,11 +894,8 @@ async def statistics_menu(call: CallbackQuery):
         # Статистика аккаунтов
         account_stats = await get_account_stats()
         
-        
+        # Статистика задач
         task_stats = await task_service.get_task_stats()
-        
-        # Статистика сессий
-        session_stats = await global_session_manager.get_stats()
         
         keyboard = IKM(inline_keyboard=[
             [IKB(text='📊 ПО ЯЗЫКАМ', callback_data='stats_by_lang')],
@@ -980,19 +911,11 @@ async def statistics_menu(call: CallbackQuery):
 ⏸️ На паузе: {account_stats.get('pause', 0)}
 🚫 Забанены: {account_stats.get('ban', 0)}
 
-<b>🧠 СЕССИИ:</b>
-💾 В памяти: {session_stats['total_loaded']}
-🟢 Подключены: {session_stats['connected']}
-🔄 Статус: {'✅ Готов' if session_stats['loading_complete'] else '⏳ Загрузка'}
-
 <b>📋 ЗАДАЧИ (task_queue):</b>
 📦 Всего в Redis: {task_stats.get('total_tasks', 0)}
 ✅ Готовых к выполнению: {task_stats.get('ready_tasks', 0)}
 ⏳ Будущих: {task_stats.get('future_tasks', 0)}
-🔄 Повторы: {task_stats.get('retry_tasks', 0)}
-
-<b>⚙️ СИСТЕМА:</b>
-💾 Буфер воркера: до 3000 задач в памяти"""
+🔄 Повторы: {task_stats.get('retry_tasks', 0)}"""
         
         await call.message.edit_text(
             text,
@@ -1040,6 +963,8 @@ async def stats_by_language(call: CallbackQuery):
         if not languages:
             text_parts.append("<i>Языки не добавлены</i>")
         
+        text_parts.append("\n все аккаунты готовы к работе")
+        
         await call.message.edit_text(
             "\n".join(text_parts),
             parse_mode='HTML',
@@ -1054,7 +979,7 @@ async def stats_by_language(call: CallbackQuery):
 
 @main_router.channel_post(F.chat.type == ChatType.CHANNEL)
 async def handle_channel_post(message: Message):
-    """Обработка новых постов в каналах - создание задач просмотра """
+    """Обработка новых постов в каналах - создание задач просмотра"""
     try:
         channel_username = message.chat.username
         if not channel_username:
@@ -1072,9 +997,10 @@ async def handle_channel_post(message: Message):
         
         if results['total_tasks'] > 0:
             logger.info(f"""
-✅ Задачи просмотра созданы:
+✅ Задачи просмотра созданы (новая схема):
    📱 Задач: {results['total_tasks']}
    🌐 Языков: {results['languages']}
+   ⚡ Режим: подключение по требованию
             """)
         else:
             logger.warning(f"⚠️ Не создано задач для @{channel_username}")
@@ -1107,7 +1033,8 @@ async def add_language_menu(call: CallbackQuery):
         
         await call.message.edit_text(
             "<b>➕ ДОБАВЛЕНИЕ ЯЗЫКА</b>\n\n"
-            "Выберите язык из списка:",
+            "Выберите язык из списка:\n\n"
+            "⚡ В новой схеме все языки готовы к работе сразу",
             parse_mode='HTML',
             reply_markup=keyboard.as_markup()
         )
@@ -1146,3 +1073,4 @@ def get_all_routers():
         settings_router,
         stats_router
     ]
+
