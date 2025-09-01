@@ -454,7 +454,6 @@ async def export_all_accounts(call: CallbackQuery):
         logger.error(f"Ошибка экспорта всех аккаунтов: {e}")
         await call.answer("❌ Произошла ошибка при создании архива", show_alert=True)
 
-
 # === УПРАВЛЕНИЕ АККАУНТАМИ ===
 @account_router.callback_query(F.data == 'accounts')
 async def accounts_menu(call: CallbackQuery):
@@ -726,7 +725,7 @@ async def delete_by_status_execute(call: CallbackQuery):
 # === НАСТРОЙКИ ===
 @settings_router.callback_query(F.data == 'settings')
 async def settings_menu(call: CallbackQuery):
-    """Меню настроек с информацией о живых настройках"""
+    """Меню настроек с расширенными параметрами батчей"""
     try:
         # Читаем текущие настройки
         settings = {
@@ -736,7 +735,12 @@ async def settings_menu(call: CallbackQuery):
             'sub_lag': read_setting('lag.txt', 30.0),
             'sub_range': read_setting('range.txt', 5.0),
             'timeout_count': int(read_setting('timeout_count.txt', 4.0)),
-            'timeout_duration': read_setting('timeout_duration.txt', 20.0)
+            'timeout_duration': read_setting('timeout_duration.txt', 20.0),
+            
+            # Новые настройки батчей
+            'view_batch_size': int(read_setting('view_batch_size.txt', 100.0)),
+            'view_batch_delay': read_setting('view_batch_delay.txt', 30.0),
+            'subscribe_batch_delay': read_setting('subscribe_batch_delay.txt', 60.0)
         }
         
         keyboard = IKM(inline_keyboard=[
@@ -747,6 +751,12 @@ async def settings_menu(call: CallbackQuery):
             [IKB(text='⏰ ЗАДЕРЖКА АККАУНТОВ', callback_data='set:accounts_delay.txt')],
             [IKB(text='🔢 ПОДПИСОК ДО ПАУЗЫ', callback_data='set:timeout_count.txt')],
             [IKB(text='⏸️ ДЛИТЕЛЬНОСТЬ ПАУЗЫ', callback_data='set:timeout_duration.txt')],
+            
+            # Новые настройки батчей
+            [IKB(text='📦 РАЗМЕР БАТЧА ПРОСМОТРОВ', callback_data='set:view_batch_size.txt')],
+            [IKB(text='⏳ ЗАДЕРЖКА БАТЧА ПРОСМОТРОВ', callback_data='set:view_batch_delay.txt')],
+            [IKB(text='⏳ ЗАДЕРЖКА БАТЧА ПОДПИСОК', callback_data='set:subscribe_batch_delay.txt')],
+            
             [IKB(text='🔄 ОБНОВИТЬ ВСЕ', callback_data='force_settings_reload')],
             [IKB(text='🔙 НАЗАД', callback_data='main_menu')]
         ])
@@ -756,12 +766,18 @@ async def settings_menu(call: CallbackQuery):
 <b>👀 ПРОСМОТРЫ:</b>
 ⏰ Период: {settings['view_period']} час
 ⏰ Между аккаунтами: {settings['view_delay']} мин
+
 <b>📺 ПОДПИСКИ:</b>
 📅 Основная задержка: {settings['sub_lag']} мин
 🎲 Разброс: {settings['sub_range']} мин
 ⏰ Задержка аккаунтов: {settings['accounts_delay']} мин
 🔢 Подписок до паузы: {settings['timeout_count']}
-⏸️ Длительность паузы: {settings['timeout_duration']} мин """
+⏸️ Длительность паузы: {settings['timeout_duration']} мин
+
+<b>📦 БАТЧИ:</b>
+👀 Размер батча просмотров: {settings['view_batch_size']}
+⏳ Задержка батча просмотров: {settings['view_batch_delay']} сек
+⏳ Задержка батча подписок: {settings['subscribe_batch_delay']} сек"""
         
         await call.message.edit_text(text, parse_mode='HTML', reply_markup=keyboard)
         
@@ -823,7 +839,12 @@ async def setting_change_start(call: CallbackQuery, state: FSMContext):
         'range.txt': 'Разброс подписок (минуты)',
         "accounts_delay.txt": 'Задержка аккаунтов (минуты)',
         'timeout_count.txt': 'Количество подписок до паузы',
-        'timeout_duration.txt': 'Длительность паузы (минуты)'
+        'timeout_duration.txt': 'Длительность паузы (минуты)',
+        
+        # Новые настройки батчей
+        'view_batch_size.txt': 'Размер батча для просмотров (количество)',
+        'view_batch_delay.txt': 'Задержка между батчами просмотров (секунды)',
+        'subscribe_batch_delay.txt': 'Задержка между батчами подписок (секунды)'
     }
     
     setting_name = setting_names.get(setting_file, setting_file)
@@ -885,20 +906,133 @@ async def setting_change_process(message: Message, state: FSMContext):
         await message.answer("❌ Произошла ошибка при сохранении")
         await state.clear()
 
-# === СТАТИСТИКА ===
+# === РАСШИРЕННАЯ СТАТИСТИКА ===
+
+async def get_extended_statistics():
+    """Получает расширенную статистику из Redis и БД"""
+    try:
+        from redis import Redis
+        from config import REDIS_HOST, REDIS_PORT, REDIS_PASSWORD
+        
+        redis_client = Redis(
+            host=REDIS_HOST,
+            port=REDIS_PORT,
+            password=REDIS_PASSWORD,
+            decode_responses=True
+        )
+        
+        current_time = time.time()
+        
+        # Базовая статистика задач из Redis
+        total_tasks = redis_client.zcard("task_queue") or 0
+        ready_tasks = redis_client.zcount("task_queue", 0, current_time) or 0
+        
+        # Задачи готовые к выполнению за временные периоды
+        ready_next_minute = redis_client.zcount("task_queue", current_time, current_time + 60) or 0
+        ready_next_hour = redis_client.zcount("task_queue", current_time, current_time + 3600) or 0
+        
+        # НОВОЕ: Получаем статистику выполненных задач из воркера
+        worker_stats_raw = redis_client.get('worker_stats')
+        if worker_stats_raw:
+            worker_stats = json.loads(worker_stats_raw)
+            
+            # Проверяем актуальность данных (не старше 5 минут)
+            stats_age = current_time - worker_stats.get('timestamp', 0)
+            if stats_age > 300:  # 5 минут
+                # Данные устарели, используем значения по умолчанию
+                executed_tasks_minute = 0
+                executed_tasks_5min = 0
+                executed_tasks_hour = 0
+                avg_per_minute = 0.0
+                avg_per_second = 0.0
+                success_rate = 0.0
+            else:
+                # Используем актуальные данные
+                executed_tasks_minute = worker_stats.get('tasks_last_minute', 0)
+                executed_tasks_5min = worker_stats.get('tasks_last_5min', 0)
+                executed_tasks_hour = worker_stats.get('tasks_last_hour', 0)
+                avg_per_minute = worker_stats.get('avg_tasks_per_minute', 0.0)
+                avg_per_second = worker_stats.get('avg_tasks_per_second', 0.0)
+                success_rate = worker_stats.get('success_rate', 0.0)
+        else:
+            # Воркер не работает или нет данных
+            executed_tasks_minute = 0
+            executed_tasks_5min = 0
+            executed_tasks_hour = 0
+            avg_per_minute = 0.0
+            avg_per_second = 0.0
+            success_rate = 0.0
+        
+        # Статистика аккаунтов
+        account_stats = await get_account_stats()
+        
+        # Получаем статистику забаненных аккаунтов за 24ч из БД
+        banned_24h = await get_banned_accounts_24h()
+        
+        # Средняя нагрузка на аккаунт (примерная)
+        active_accounts = account_stats.get('active', 1)
+        avg_tasks_per_account = (ready_next_hour / active_accounts) if active_accounts > 0 else 0
+        
+        return {
+            # Готовые задачи
+            'ready_tasks_minute': ready_next_minute,
+            'ready_tasks_hour': ready_next_hour,
+            
+            # ОБНОВЛЕННЫЕ выполненные задачи
+            'executed_tasks_minute': executed_tasks_minute,
+            'executed_tasks_5min': executed_tasks_5min,
+            'executed_tasks_hour': executed_tasks_hour,
+            
+            # НОВЫЕ средние показатели
+            'avg_tasks_per_minute': avg_per_minute,
+            'avg_tasks_per_second': avg_per_second,
+            
+            # Среднее по аккаунтам
+            'avg_tasks_per_account_hour': avg_tasks_per_account,
+            
+            # Забаненные за 24ч
+            'banned_accounts_24h': banned_24h,
+            
+            # Общие показатели
+            'total_tasks': total_tasks,
+            'ready_now': ready_tasks,
+            'success_rate': success_rate,
+            
+            # Статус воркера
+            'worker_online': worker_stats_raw is not None,
+            'stats_age': stats_age if worker_stats_raw else 999999
+        }
+        
+    except Exception as e:
+        logger.error(f"Ошибка получения расширенной статистики: {e}")
+        return {}
+
+async def get_banned_accounts_24h():
+    """Получает количество забаненных аккаунтов за последние 24 часа"""
+    try:
+        from database import db_session
+        async with db_session() as conn:
+            result = await conn.fetchval(
+                "SELECT COUNT(*) FROM accounts WHERE status = 'ban' AND updated_at >= NOW() - INTERVAL '24 hours'"
+            )
+            return result or 0
+    except Exception as e:
+        logger.error(f"Ошибка получения статистики банов: {e}")
+        return 0
 
 @stats_router.callback_query(F.data == 'statistics')
 async def statistics_menu(call: CallbackQuery):
-    """Меню статистики"""
+    """Меню статистики с расширенными данными"""
     try:
         # Статистика аккаунтов
         account_stats = await get_account_stats()
         
-        # Статистика задач
-        task_stats = await task_service.get_task_stats()
+        # Расширенная статистика задач
+        extended_stats = await get_extended_statistics()
         
         keyboard = IKM(inline_keyboard=[
             [IKB(text='📊 ПО ЯЗЫКАМ', callback_data='stats_by_lang')],
+            [IKB(text='📈 ДЕТАЛЬНАЯ СТАТИСТИКА', callback_data='detailed_stats')],
             [IKB(text='🔄 ОБНОВИТЬ', callback_data='statistics')],
             [IKB(text='🔙 НАЗАД', callback_data='main_menu')]
         ])
@@ -912,10 +1046,15 @@ async def statistics_menu(call: CallbackQuery):
 🚫 Забанены: {account_stats.get('ban', 0)}
 
 <b>📋 ЗАДАЧИ (task_queue):</b>
-📦 Всего в Redis: {task_stats.get('total_tasks', 0)}
-✅ Готовых к выполнению: {task_stats.get('ready_tasks', 0)}
-⏳ Будущих: {task_stats.get('future_tasks', 0)}
-🔄 Повторы: {task_stats.get('retry_tasks', 0)}"""
+📦 Всего в Redis: {extended_stats.get('total_tasks', 0)}
+✅ Готовых к выполнению: {extended_stats.get('ready_now', 0)}
+⏳ Будущих: {extended_stats.get('total_tasks', 0) - extended_stats.get('ready_now', 0)}
+
+<b>⚡ ПРОИЗВОДИТЕЛЬНОСТЬ:</b>
+📈 Готовых задач за минуту: {extended_stats.get('ready_tasks_minute', 0)}
+📈 Готовых задач за час: {extended_stats.get('ready_tasks_hour', 0)}
+🎯 Средняя загрузка аккаунта/час: {extended_stats.get('avg_tasks_per_account_hour', 0):.1f}
+🚫 Забанено за 24ч: {extended_stats.get('banned_accounts_24h', 0)}"""
         
         await call.message.edit_text(
             text,
@@ -925,6 +1064,68 @@ async def statistics_menu(call: CallbackQuery):
         
     except Exception as e:
         logger.error(f"Ошибка статистики: {e}")
+        await call.answer("❌ Произошла ошибка", show_alert=True)
+
+@stats_router.callback_query(F.data == 'detailed_stats')
+async def detailed_statistics(call: CallbackQuery):
+    """Детальная статистика с расширенными метриками"""
+    try:
+        extended_stats = await get_extended_statistics()
+        
+        # Получаем дополнительную статистику воркера
+        task_stats = await task_service.get_task_stats()
+        
+        keyboard = IKM(inline_keyboard=[
+            [IKB(text='🔄 ОБНОВИТЬ', callback_data='detailed_stats')],
+            [IKB(text='🔙 НАЗАД', callback_data='statistics')]
+        ])
+        
+        # Статус воркера
+        worker_status = "🟢 Онлайн" if extended_stats.get('worker_online', False) else "🔴 Оффлайн"
+        stats_freshness = ""
+        if extended_stats.get('stats_age', 0) < 120:
+            stats_freshness = "📊 Данные актуальные"
+        elif extended_stats.get('stats_age', 0) < 300:
+            stats_freshness = "⚠️ Данные устарели"
+        else:
+            stats_freshness = "❌ Воркер не отвечает"
+        
+        text = f"""<b>📈 ДЕТАЛЬНАЯ СТАТИСТИКА</b>
+
+<b>🚀 ГОТОВЫЕ ЗАДАЧИ:</b>
+⏰ За следующую минуту: {extended_stats.get('ready_tasks_minute', 0)}
+⏰ За следующий час: {extended_stats.get('ready_tasks_hour', 0)}
+
+<b>✅ ВЫПОЛНЕННЫЕ ЗАДАЧИ:</b>
+📊 За минуту: {extended_stats.get('executed_tasks_minute', 0)}
+📊 За 5 минут: {extended_stats.get('executed_tasks_5min', 0)}
+📊 За час: {extended_stats.get('executed_tasks_hour', 0)}
+
+<b>⚡ СРЕДНИЕ ПОКАЗАТЕЛИ:</b>
+📈 Среднее в минуту: {extended_stats.get('avg_tasks_per_minute', 0.0):.1f}
+⚡ Среднее в секунду: {extended_stats.get('avg_tasks_per_second', 0.0):.2f}
+
+<b>👤 ПО АККАУНТАМ:</b>
+📈 Среднее задач/аккаунт/час: {extended_stats.get('avg_tasks_per_account_hour', 0):.2f}
+🚫 Забанено за 24ч: {extended_stats.get('banned_accounts_24h', 0)}
+
+<b>🎯 ЭФФЕКТИВНОСТЬ:</b>
+✅ Успешность выполнения: {extended_stats.get('success_rate', 0.0):.1f}%
+🔄 Задач в retry: {task_stats.get('retry_tasks', 0)}
+
+<b>ℹ️ ДОПОЛНИТЕЛЬНО:</b>
+🤖 Воркер: {worker_status}
+📊 {stats_freshness}
+🕐 Время обновления: {time.strftime('%H:%M:%S')}"""
+        
+        await call.message.edit_text(
+            text,
+            parse_mode='HTML',
+            reply_markup=keyboard
+        )
+        
+    except Exception as e:
+        logger.error(f"Ошибка детальной статистики: {e}")
         await call.answer("❌ Произошла ошибка", show_alert=True)
 
 @stats_router.callback_query(F.data == 'stats_by_lang')
@@ -976,11 +1177,22 @@ async def stats_by_language(call: CallbackQuery):
         await call.answer("❌ Произошла ошибка", show_alert=True)
 
 # === ОБРАБОТКА ПОСТОВ КАНАЛОВ ===
+BOT_START_TIME = time.time()
 
 @main_router.channel_post(F.chat.type == ChatType.CHANNEL)
 async def handle_channel_post(message: Message):
     """Обработка новых постов в каналах - создание задач просмотра"""
     try:
+        # ЗАЩИТА: Игнорируем старые посты (старше 5 минут)
+        if message.date:
+            message_time = message.date.timestamp()
+            current_time = time.time()
+            
+            # Если пост старше 5 минут или был создан до запуска бота
+            if (current_time - message_time > 300) or (message_time < BOT_START_TIME):
+                logger.debug(f"⏭️ Пропускаю старый пост от {message.date} в @{message.chat.username}")
+                return
+        
         channel_username = message.chat.username
         if not channel_username:
             logger.warning("⛔ Пост в канале без username")
@@ -988,7 +1200,7 @@ async def handle_channel_post(message: Message):
         
         post_id = message.message_id
         
-        logger.info(f"📝 Новый пост в @{channel_username}, ID: {post_id}")
+        logger.info(f"📝 НОВЫЙ пост в @{channel_username}, ID: {post_id}")
         
         # Создаем задачи просмотра 
         results = await task_service.create_view_tasks_for_post(
@@ -997,17 +1209,18 @@ async def handle_channel_post(message: Message):
         
         if results['total_tasks'] > 0:
             logger.info(f"""
-✅ Задачи просмотра созданы (новая схема):
+✅ Задачи просмотра созданы для НОВОГО поста:
+   📺 Канал: @{channel_username}
+   📝 Пост ID: {post_id}
    📱 Задач: {results['total_tasks']}
    🌐 Языков: {results['languages']}
    ⚡ Режим: подключение по требованию
             """)
         else:
-            logger.warning(f"⚠️ Не создано задач для @{channel_username}")
+            logger.warning(f"⚠️ Не создано задач для @{channel_username} (возможно канал не в БД)")
         
     except Exception as e:
         logger.error(f"💥 Ошибка обработки поста: {e}")
-
 # === ДОБАВЛЕНИЕ ЯЗЫКА ===
 
 @lang_router.callback_query(F.data == 'add_language')
@@ -1073,4 +1286,3 @@ def get_all_routers():
         settings_router,
         stats_router
     ]
-

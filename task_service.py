@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from enum import Enum
 
 from config import read_setting, find_english_word
-from database import get_accounts_by_lang, get_channels_by_lang
+from database import get_accounts_by_lang, get_channels_by_lang, get_banned_accounts_24h, get_extended_account_stats
 from exceptions import TaskProcessingError
 
 logger = logging.getLogger(__name__)
@@ -474,7 +474,7 @@ class TaskService:
             logger.error(f"Ошибка сохранения задач в Redis: {e}")
     
     async def get_task_stats(self) -> Dict[str, int]:
-        """Получает статистику задач из общей очереди"""
+        """Получает базовую статистику задач из общей очереди"""
         try:
             current_time = time.time()
             
@@ -490,113 +490,109 @@ class TaskService:
             # Retry задачи
             retry_tasks = self.redis_client.llen("retry_tasks") or 0
             
-            # Анализ типов задач (для диагностики)
-            sample_tasks = self.redis_client.zrangebyscore(
-                "task_queue", 0, '+inf', start=0, num=100
-            )
-            
-            view_count = 0
-            subscribe_count = 0
-            
-            for task_json in sample_tasks:
-                try:
-                    task_data = json.loads(task_json)
-                    task_type = task_data.get('task_type', '')
-                    if task_type == 'view':
-                        view_count += 1
-                    elif task_type == 'subscribe':
-                        subscribe_count += 1
-                except:
-                    pass
-            
             return {
                 'total_tasks': total_tasks,
                 'ready_tasks': ready_tasks,
                 'future_tasks': future_tasks,
                 'retry_tasks': retry_tasks,
-                'queue_name': 'task_queue',
-                'sample_views': view_count,
-                'sample_subscribes': subscribe_count
+                'queue_name': 'task_queue'
             }
             
         except Exception as e:
             logger.error(f"Ошибка получения статистики задач: {e}")
             return {}
     
-    async def get_detailed_task_analysis(self) -> Dict:
-        """Получает детальный анализ задач для диагностики"""
+
+    async def get_enhanced_task_stats(self) -> Dict:
+        """Получает расширенную статистику задач включая данные воркера"""
         try:
             current_time = time.time()
             
-            # Получаем образец задач для анализа
-            sample_tasks = self.redis_client.zrangebyscore(
-                "task_queue", 
-                min=0, 
-                max='+inf',
-                withscores=True,
-                start=0, 
-                num=500
-            )
+            # Базовая статистика из Redis
+            total_tasks = self.redis_client.zcard("task_queue") or 0
+            ready_tasks = self.redis_client.zcount("task_queue", 0, current_time) or 0
+            retry_tasks = self.redis_client.llen("retry_tasks") or 0
             
-            analysis = {
-                'total_analyzed': len(sample_tasks),
-                'by_type': {'view': 0, 'subscribe': 0, 'unknown': 0},
-                'by_timing': {
-                    'ready_now': 0,
-                    'ready_5min': 0,
-                    'ready_1hour': 0,
-                    'future': 0
-                },
-                'by_language': {},
-                'oldest_task': None,
-                'newest_task': None
+            # Готовые задачи на ближайшие периоды
+            ready_next_minute = self.redis_client.zcount("task_queue", current_time, current_time + 60) or 0
+            ready_next_hour = self.redis_client.zcount("task_queue", current_time, current_time + 3600) or 0
+            
+            # НОВОЕ: Получаем статистику выполненных задач из воркера
+            worker_stats_raw = self.redis_client.get('worker_stats')
+            if worker_stats_raw:
+                worker_stats = json.loads(worker_stats_raw)
+                
+                # Проверяем актуальность данных
+                stats_age = current_time - worker_stats.get('timestamp', 0)
+                if stats_age <= 300:  # Данные не старше 5 минут
+                    executed_minute = worker_stats.get('tasks_last_minute', 0)
+                    executed_5min = worker_stats.get('tasks_last_5min', 0) 
+                    executed_hour = worker_stats.get('tasks_last_hour', 0)
+                    avg_per_minute = worker_stats.get('avg_tasks_per_minute', 0.0)
+                    avg_per_second = worker_stats.get('avg_tasks_per_second', 0.0)
+                    worker_success_rate = worker_stats.get('success_rate', 0.0)
+                    view_tasks = worker_stats.get('view_tasks', 0)
+                    subscribe_tasks = worker_stats.get('subscribe_tasks', 0)
+                else:
+                    # Данные устарели
+                    executed_minute = executed_5min = executed_hour = 0
+                    avg_per_minute = avg_per_second = worker_success_rate = 0.0
+                    view_tasks = subscribe_tasks = 0
+            else:
+                # Нет данных от воркера
+                executed_minute = executed_5min = executed_hour = 0
+                avg_per_minute = avg_per_second = worker_success_rate = 0.0
+                view_tasks = subscribe_tasks = 0
+            
+            # Дополнительная статистика аккаунтов
+            from database import get_extended_account_stats, get_banned_accounts_24h
+            account_stats = await get_extended_account_stats()
+            banned_24h = await get_banned_accounts_24h()
+            
+            enhanced_stats = {
+                # Основные метрики
+                'total_tasks': total_tasks,
+                'ready_tasks': ready_tasks,
+                'future_tasks': total_tasks - ready_tasks,
+                'retry_tasks': retry_tasks,
+                
+                # Готовые задачи по времени
+                'ready_tasks_minute': ready_next_minute,
+                'ready_tasks_hour': ready_next_hour,
+                
+                # ОБНОВЛЕННЫЕ выполненные задачи
+                'executed_tasks_minute': executed_minute,
+                'executed_tasks_5min': executed_5min,
+                'executed_tasks_hour': executed_hour,
+                
+                # НОВЫЕ средние показатели
+                'avg_tasks_per_minute': avg_per_minute,
+                'avg_tasks_per_second': avg_per_second,
+                
+                # Статистика по типам задач
+                'view_tasks_executed': view_tasks,
+                'subscribe_tasks_executed': subscribe_tasks,
+                
+                # Статистика аккаунтов
+                'banned_accounts_24h': banned_24h,
+                'avg_tasks_per_account_hour': account_stats.get('avg_tasks_per_account_hour', 0.0),
+                'active_accounts': account_stats.get('active', 0),
+                
+                # Эффективность
+                'success_rate': worker_success_rate,
+                
+                # Статус системы
+                'worker_online': worker_stats_raw is not None,
+                'stats_timestamp': current_time,
+                'formatted_time': time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(current_time))
             }
             
-            for task_json, execute_at in sample_tasks:
-                try:
-                    task_data = json.loads(task_json)
-                    
-                    # Анализ по типам
-                    task_type = task_data.get('task_type', 'unknown')
-                    analysis['by_type'][task_type] = analysis['by_type'].get(task_type, 0) + 1
-                    
-                    # Анализ по времени
-                    time_diff = execute_at - current_time
-                    if time_diff <= 0:
-                        analysis['by_timing']['ready_now'] += 1
-                    elif time_diff <= 300:  # 5 минут
-                        analysis['by_timing']['ready_5min'] += 1
-                    elif time_diff <= 3600:  # 1 час
-                        analysis['by_timing']['ready_1hour'] += 1
-                    else:
-                        analysis['by_timing']['future'] += 1
-                    
-                    # Анализ по языкам
-                    lang = task_data.get('lang', 'unknown')
-                    analysis['by_language'][lang] = analysis['by_language'].get(lang, 0) + 1
-                    
-                    # Самые старые и новые задачи
-                    created_at = task_data.get('created_at', execute_at)
-                    if analysis['oldest_task'] is None or created_at < analysis['oldest_task']:
-                        analysis['oldest_task'] = created_at
-                    if analysis['newest_task'] is None or created_at > analysis['newest_task']:
-                        analysis['newest_task'] = created_at
-                        
-                except Exception as e:
-                    logger.debug(f"Ошибка анализа задачи: {e}")
-                    continue
-            
-            # Конвертируем timestamps
-            if analysis['oldest_task']:
-                analysis['oldest_task'] = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(analysis['oldest_task']))
-            if analysis['newest_task']:
-                analysis['newest_task'] = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(analysis['newest_task']))
-            
-            return analysis
+            return enhanced_stats
             
         except Exception as e:
-            logger.error(f"Ошибка детального анализа задач: {e}")
+            logger.error(f"Ошибка получения расширенной статистики задач: {e}")
             return {}
+
     
     async def cleanup_expired_tasks(self, max_age_hours: float = 48.0) -> int:
         """Очищает просроченные задачи"""
@@ -627,5 +623,5 @@ class TaskService:
             logger.error(f"Ошибка очистки просроченных задач: {e}")
             return 0
 
-# Глобальный экземпляр 
+# Экспортируем экземпляр сервиса
 task_service = TaskService()

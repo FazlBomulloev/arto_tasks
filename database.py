@@ -113,7 +113,7 @@ async def create_tables():
                     )
                 """)
 
-                # Таблица статистики
+                # Таблица статистики (расширенная)
                 await conn.execute(f"""
                     CREATE TABLE IF NOT EXISTS {TAB_STAT}(
                         id SERIAL PRIMARY KEY,
@@ -121,6 +121,9 @@ async def create_tables():
                         views INTEGER DEFAULT 0,
                         subs INTEGER DEFAULT 0,
                         lang TEXT DEFAULT 'all',
+                        banned_accounts INTEGER DEFAULT 0,
+                        failed_tasks INTEGER DEFAULT 0,
+                        successful_tasks INTEGER DEFAULT 0,
                         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                     )
                 """)
@@ -131,6 +134,14 @@ async def create_tables():
                 except:
                     pass  # Поле уже существует
 
+                # Добавляем новые поля статистики если их нет
+                try:
+                    await conn.execute(f"ALTER TABLE {TAB_STAT} ADD COLUMN IF NOT EXISTS banned_accounts INTEGER DEFAULT 0")
+                    await conn.execute(f"ALTER TABLE {TAB_STAT} ADD COLUMN IF NOT EXISTS failed_tasks INTEGER DEFAULT 0")
+                    await conn.execute(f"ALTER TABLE {TAB_STAT} ADD COLUMN IF NOT EXISTS successful_tasks INTEGER DEFAULT 0")
+                except:
+                    pass  # Поля уже существуют
+
                 # Индексы для оптимизации
                 await conn.execute(f"CREATE INDEX IF NOT EXISTS idx_acc_lang ON {TAB_ACC}(lang)")
                 await conn.execute(f"CREATE INDEX IF NOT EXISTS idx_acc_status ON {TAB_ACC}(status)")
@@ -138,8 +149,10 @@ async def create_tables():
                 await conn.execute(f"CREATE INDEX IF NOT EXISTS idx_chan_lang ON {TAB_CHAN}(lang)")
                 await conn.execute(f"CREATE INDEX IF NOT EXISTS idx_stat_date ON {TAB_STAT}(date)")
                 
-                # Специальный индекс для забаненных аккаунтов
+                # Специальные индексы для расширенной статистики
                 await conn.execute(f"CREATE INDEX IF NOT EXISTS idx_acc_ban_retry ON {TAB_ACC}(status, last_used) WHERE status = 'ban'")
+                await conn.execute(f"CREATE INDEX IF NOT EXISTS idx_acc_updated_status ON {TAB_ACC}(updated_at, status)")
+                await conn.execute(f"CREATE INDEX IF NOT EXISTS idx_acc_ban_24h ON {TAB_ACC}(updated_at) WHERE status = 'ban'")
 
                 # Триггер для обновления updated_at
                 await conn.execute(f"""
@@ -160,7 +173,7 @@ async def create_tables():
                         EXECUTE FUNCTION update_updated_at_column();
                 """)
 
-            logger.info("Database tables created successfully")
+            logger.info("Database tables created successfully with extended statistics")
 
         except Exception as e:
             logger.error(f"Failed to create tables: {e}")
@@ -342,6 +355,90 @@ async def get_account_stats() -> Dict[str, int]:
             logger.error(f"Failed to get account stats: {e}")
             return {}
 
+# === Extended Statistics ===
+
+async def get_banned_accounts_24h() -> int:
+    """Получает количество забаненных аккаунтов за последние 24 часа"""
+    async with db_session() as conn:
+        try:
+            result = await conn.fetchval(
+                f"""SELECT COUNT(*) FROM {TAB_ACC} 
+                   WHERE status = 'ban' 
+                   AND updated_at >= NOW() - INTERVAL '24 hours'"""
+            )
+            return result or 0
+        except Exception as e:
+            logger.error(f"Failed to get banned accounts 24h stats: {e}")
+            return 0
+
+async def get_account_activity_stats() -> Dict[str, float]:
+    """Получает статистику активности аккаунтов"""
+    async with db_session() as conn:
+        try:
+            stats = {}
+            
+            # Средняя активность аккаунтов за час (примерно)
+            active_accounts = await conn.fetchval(
+                f"SELECT COUNT(*) FROM {TAB_ACC} WHERE status = 'active'"
+            )
+            
+            # Аккаунты, использованные за последний час
+            used_last_hour = await conn.fetchval(
+                f"""SELECT COUNT(*) FROM {TAB_ACC} 
+                   WHERE last_used >= NOW() - INTERVAL '1 hour'
+                   AND status = 'active'"""
+            )
+            
+            # Средняя нагрузка на аккаунт
+            if active_accounts > 0:
+                stats['avg_usage_per_account_hour'] = used_last_hour / active_accounts
+            else:
+                stats['avg_usage_per_account_hour'] = 0.0
+            
+            stats['active_accounts'] = active_accounts
+            stats['used_last_hour'] = used_last_hour
+            
+            return stats
+            
+        except Exception as e:
+            logger.error(f"Failed to get account activity stats: {e}")
+            return {}
+
+async def get_extended_account_stats() -> Dict:
+    """Получает расширенную статистику аккаунтов"""
+    async with db_session() as conn:
+        try:
+            stats = await get_account_stats()
+            
+            # Добавляем расширенные метрики
+            banned_24h = await get_banned_accounts_24h()
+            activity_stats = await get_account_activity_stats()
+            
+            # Статистика по времени создания
+            new_accounts_24h = await conn.fetchval(
+                f"""SELECT COUNT(*) FROM {TAB_ACC} 
+                   WHERE created_at >= NOW() - INTERVAL '24 hours'"""
+            )
+            
+            # Статистика неудач
+            high_fail_accounts = await conn.fetchval(
+                f"""SELECT COUNT(*) FROM {TAB_ACC} 
+                   WHERE fail >= 2 AND status != 'ban'"""
+            )
+            
+            stats.update({
+                'banned_24h': banned_24h,
+                'new_accounts_24h': new_accounts_24h,
+                'high_fail_accounts': high_fail_accounts,
+                'avg_tasks_per_account_hour': activity_stats.get('avg_usage_per_account_hour', 0.0)
+            })
+            
+            return stats
+            
+        except Exception as e:
+            logger.error(f"Failed to get extended account stats: {e}")
+            return {}
+
 # === Channel Management ===
 
 async def add_channel(name: str, lang: str) -> bool:
@@ -405,4 +502,60 @@ async def get_all_languages() -> List[str]:
             return [row['name'] for row in rows]
         except Exception as e:
             logger.error(f"Failed to get languages: {e}")
+            return []
+
+# === Task Statistics ===
+
+async def record_task_execution(task_type: str, success: bool, lang: str = 'all'):
+    """Записывает статистику выполнения задач"""
+    async with db_session() as conn:
+        try:
+            today = datetime.now().date()
+            
+            # Обновляем или создаем запись статистики
+            if success:
+                if task_type == 'view':
+                    await conn.execute(
+                        f"""INSERT INTO {TAB_STAT} (date, views, successful_tasks, lang) VALUES ($1, 1, 1, $2)
+                           ON CONFLICT (date, lang) DO UPDATE SET 
+                           views = {TAB_STAT}.views + 1,
+                           successful_tasks = {TAB_STAT}.successful_tasks + 1""",
+                        today, lang
+                    )
+                elif task_type == 'subscribe':
+                    await conn.execute(
+                        f"""INSERT INTO {TAB_STAT} (date, subs, successful_tasks, lang) VALUES ($1, 1, 1, $2)
+                           ON CONFLICT (date, lang) DO UPDATE SET 
+                           subs = {TAB_STAT}.subs + 1,
+                           successful_tasks = {TAB_STAT}.successful_tasks + 1""",
+                        today, lang
+                    )
+            else:
+                await conn.execute(
+                    f"""INSERT INTO {TAB_STAT} (date, failed_tasks, lang) VALUES ($1, 1, $2)
+                       ON CONFLICT (date, lang) DO UPDATE SET 
+                       failed_tasks = {TAB_STAT}.failed_tasks + 1""",
+                    today, lang
+                )
+                
+        except Exception as e:
+            logger.error(f"Failed to record task execution: {e}")
+
+async def get_daily_statistics(days: int = 7) -> List[Dict]:
+    """Получает дневную статистику за указанное количество дней"""
+    async with db_session() as conn:
+        try:
+            rows = await conn.fetch(
+                f"""SELECT date, SUM(views) as views, SUM(subs) as subs, 
+                          SUM(successful_tasks) as successful_tasks,
+                          SUM(failed_tasks) as failed_tasks,
+                          SUM(banned_accounts) as banned_accounts
+                   FROM {TAB_STAT}
+                   WHERE date >= CURRENT_DATE - INTERVAL '{days} days'
+                   GROUP BY date
+                   ORDER BY date DESC""",
+            )
+            return [dict(row) for row in rows]
+        except Exception as e:
+            logger.error(f"Failed to get daily statistics: {e}")
             return []
