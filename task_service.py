@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from enum import Enum
 
 from config import read_setting, find_english_word
-from database import get_accounts_by_lang, get_channels_by_lang, get_banned_accounts_24h, get_extended_account_stats
+from database import get_accounts_by_lang, get_channels_by_lang, get_banned_accounts_24h
 from exceptions import TaskProcessingError
 
 logger = logging.getLogger(__name__)
@@ -55,7 +55,7 @@ class TaskService:
         
     async def create_view_tasks_for_post(self, channel_username: str, post_id: int) -> Dict[str, int]:
         """
-        Создает задачи просмотра для нового поста
+        Создает задачи просмотра для нового поста (для смешанных батчей)
         """
         results = {
             'total_tasks': 0,
@@ -105,13 +105,15 @@ class TaskService:
                 return results
             
             # 3. Равномерно распределяем по времени и сохраняем в Redis
-            await self._schedule_view_tasks_simple(all_tasks, view_duration)
+            await self._schedule_tasks_for_mixed_batches(all_tasks, view_duration)
             
             logger.info(f"""
-✅ Создано {results['total_tasks']} задач просмотра:
+✅ Создано {results['total_tasks']} задач просмотра для СМЕШАННЫХ батчей:
    📺 Пост: {post_id}
    🌐 Языков: {results['languages']}  
-   ⏰ Период: {view_hours} часов""")
+   ⏰ Период: {view_hours} часов
+   📦 Режим: Смешанные батчи
+            """)
             
             return results
             
@@ -133,8 +135,8 @@ class TaskService:
             logger.error(f"Ошибка получения языков канала: {e}")
             return []
     
-    async def _schedule_view_tasks_simple(self, tasks: List[TaskItem], duration_seconds: int):
-        """Планирует задачи просмотра в единую Redis очередь"""
+    async def _schedule_tasks_for_mixed_batches(self, tasks: List[TaskItem], duration_seconds: int):
+        """Планирует задачи для смешанных батчей в единую Redis очередь"""
         if not tasks:
             return
         
@@ -153,7 +155,7 @@ class TaskService:
             
             logger.info(f"⏱️ Интервал между просмотрами: {interval:.1f} секунд")
             
-            # Подготавливаем данные для Redis
+            # Подготавливаем данные для Redis (единая очередь для смешанных батчей)
             tasks_data = {}
             
             for idx, task in enumerate(tasks):
@@ -181,7 +183,7 @@ class TaskService:
                 # Используем execute_at как score для сортировки
                 tasks_data[json.dumps(task_data)] = execute_at
             
-            # Записываем все задачи в единую sorted set
+            # Записываем все задачи в единую sorted set для смешанных батчей
             if tasks_data:
                 self.redis_client.zadd("task_queue", tasks_data)
                 
@@ -192,17 +194,19 @@ class TaskService:
                 last_time = max(tasks_data.values())
                 
                 logger.info(f"""
-📋 Добавлено {len(tasks)} задач просмотра в task_queue:
+📋 Добавлено {len(tasks)} задач просмотра в СМЕШАННУЮ ОЧЕРЕДЬ:
    ⏰ Первая задача: через {(first_time - current_time)/60:.1f} мин
    ⏰ Последняя задача: через {(last_time - current_time)/60:.1f} мин
    📊 Период: {(last_time - first_time)/3600:.2f} часов
+   📦 Готовы для смешанных батчей
                 """)
             
         except Exception as e:
-            logger.error(f"Ошибка планирования задач просмотра: {e}")
-            raise TaskProcessingError(f"Failed to schedule view tasks: {e}")
+            logger.error(f"Ошибка планирования задач просмотра для смешанных батчей: {e}")
+            raise TaskProcessingError(f"Failed to schedule view tasks for mixed batches: {e}")
     
     async def create_subscription_tasks(self, channel_name: str, target_lang: str) -> Dict[str, int]:
+        """Создает задачи подписки для смешанных батчей"""
         results = {
             'total_tasks': 0,
             'accounts_processed': 0
@@ -226,13 +230,15 @@ class TaskService:
             timeout_duration = read_setting('timeout_duration.txt', 13.0) * 60  # в секундах
             
             logger.info(f"""
-📺 СОЗДАНИЕ ЗАДАЧ ПОДПИСКИ ДЛЯ @{channel_name}:
+📺 СОЗДАНИЕ ЗАДАЧ ПОДПИСКИ ДЛЯ СМЕШАННЫХ БАТЧЕЙ:
    📱 Аккаунтов: {len(accounts)}
    🌐 Язык: {target_lang}
+   📺 Канал: @{channel_name}
    ⏰ Базовая задержка: {base_delay/60:.1f} мин
    🎲 Разброс: ±{range_val/60:.1f} мин
    🔢 Подписок до паузы: {timeout_count}
-   ⏸️ Длительность паузы: {timeout_duration/60:.1f} мин""")
+   ⏸️ Длительность паузы: {timeout_duration/60:.1f} мин
+   📦 Режим: Смешанные батчи""")
             
             # Перемешиваем аккаунты для равномерности
             random.shuffle(accounts)
@@ -285,8 +291,8 @@ class TaskService:
             
             results['total_tasks'] = len(subscription_tasks)
             
-            # Планируем в ту же очередь что и просмотры
-            await self._schedule_subscription_tasks_simple(subscription_tasks)
+            # Планируем в ту же очередь что и просмотры (смешанные батчи)
+            await self._schedule_subscription_tasks_for_mixed_batches(subscription_tasks)
             
             # Статистика времени
             if subscription_tasks:
@@ -295,12 +301,13 @@ class TaskService:
                 duration_hours = (last_time - first_time) / 3600
                 
                 logger.info(f"""
-✅ Создано {results['total_tasks']} задач подписки:
+✅ Создано {results['total_tasks']} задач подписки для СМЕШАННЫХ БАТЧЕЙ:
    📺 Канал: @{channel_name}
    📱 Аккаунтов: {results['accounts_processed']}
    ⏰ Первая подписка: сразу
    🕐 Последняя подписка: через {duration_hours:.1f} часов
-   📊 Общая длительность: {duration_hours:.1f} часов""")
+   📊 Общая длительность: {duration_hours:.1f} часов
+   📦 Будут смешаны с просмотрами в батчах""")
             
             return results
             
@@ -308,8 +315,8 @@ class TaskService:
             logger.error(f"💥 Ошибка создания задач подписки: {e}")
             raise TaskProcessingError(f"Failed to create subscription tasks: {e}")
     
-    async def _schedule_subscription_tasks_simple(self, tasks: List[TaskItem]):
-        """Планирует задачи подписки в общую очередь"""
+    async def _schedule_subscription_tasks_for_mixed_batches(self, tasks: List[TaskItem]):
+        """Планирует задачи подписки в общую очередь для смешанных батчей"""
         try:
             tasks_data = {}
             
@@ -327,22 +334,22 @@ class TaskService:
                 
                 tasks_data[json.dumps(task_data)] = task.execute_at
             
-            # Добавляем в ту же очередь что и просмотры
+            # Добавляем в ту же очередь что и просмотры для смешанных батчей
             if tasks_data:
                 self.redis_client.zadd("task_queue", tasks_data)
                 
                 # TTL на 48 часов
                 self.redis_client.expire("task_queue", 48 * 3600)
                 
-                logger.info(f"📋 Добавлено {len(tasks)} задач подписки в task_queue")
+                logger.info(f"📋 Добавлено {len(tasks)} задач подписки в СМЕШАННУЮ ОЧЕРЕДЬ task_queue")
             
         except Exception as e:
-            logger.error(f"Ошибка планирования задач подписки: {e}")
-            raise TaskProcessingError(f"Failed to schedule subscription tasks: {e}")
+            logger.error(f"Ошибка планирования задач подписки для смешанных батчей: {e}")
+            raise TaskProcessingError(f"Failed to schedule subscription tasks for mixed batches: {e}")
     
     async def create_subscription_tasks_for_new_accounts(self, accounts: List[Dict], target_lang: str) -> Dict[str, int]:
         """
-        Создает задачи подписки для новых аккаунтов на все каналы языка
+        Создает задачи подписки для новых аккаунтов на все каналы языка (для смешанных батчей)
         Используется при добавлении новых аккаунтов
         """
         subscription_stats = {
@@ -362,34 +369,34 @@ class TaskService:
             subscription_stats['channels_found'] = len(channels)
             subscription_stats['accounts_processed'] = len(accounts)
             
-            logger.info(f"📺 Создание задач подписки: {len(accounts)} аккаунтов на {len(channels)} каналов")
+            logger.info(f"📺 Создание задач подписки для СМЕШАННЫХ БАТЧЕЙ: {len(accounts)} аккаунтов на {len(channels)} каналов")
             
             # Создаем задачи для каждого канала
             total_tasks_created = 0
             
             for channel_name in channels:
                 try:
-                    channel_tasks = await self._create_subscription_tasks_for_channel(
+                    channel_tasks = await self._create_subscription_tasks_for_channel_mixed(
                         channel_name, accounts, target_lang
                     )
                     
                     total_tasks_created += channel_tasks
-                    logger.debug(f"✅ Канал @{channel_name}: {channel_tasks} задач")
+                    logger.debug(f"✅ Канал @{channel_name}: {channel_tasks} задач для смешанных батчей")
                     
                 except Exception as e:
                     logger.error(f"❌ Ошибка создания задач для @{channel_name}: {e}")
             
             subscription_stats['tasks_created'] = total_tasks_created
             
-            logger.info(f"📊 Создано {total_tasks_created} задач подписки для новых аккаунтов")
+            logger.info(f"📊 Создано {total_tasks_created} задач подписки для новых аккаунтов в смешанных батчах")
             return subscription_stats
             
         except Exception as e:
             logger.error(f"💥 Ошибка создания задач подписки для новых аккаунтов: {e}")
             return subscription_stats
     
-    async def _create_subscription_tasks_for_channel(self, channel_name: str, accounts: List[Dict], target_lang: str) -> int:
-        """Создает задачи подписки на один канал для списка аккаунтов"""
+    async def _create_subscription_tasks_for_channel_mixed(self, channel_name: str, accounts: List[Dict], target_lang: str) -> int:
+        """Создает задачи подписки на один канал для списка аккаунтов (для смешанных батчей)"""
         try:
             if not accounts:
                 return 0
@@ -443,17 +450,17 @@ class TaskService:
                 
                 subscription_tasks.append(task_data)
             
-            # Сохраняем в Redis
-            await self._save_tasks_to_redis(subscription_tasks)
+            # Сохраняем в Redis (смешанная очередь)
+            await self._save_tasks_to_mixed_queue(subscription_tasks)
             
             return len(subscription_tasks)
             
         except Exception as e:
-            logger.error(f"Ошибка создания задач подписки для канала {channel_name}: {e}")
+            logger.error(f"Ошибка создания задач подписки для канала {channel_name} в смешанных батчах: {e}")
             return 0
     
-    async def _save_tasks_to_redis(self, tasks: List[Dict]):
-        """Сохраняет задачи в Redis"""
+    async def _save_tasks_to_mixed_queue(self, tasks: List[Dict]):
+        """Сохраняет задачи в смешанную очередь Redis"""
         try:
             # Подготавливаем данные для Redis
             tasks_data = {}
@@ -463,25 +470,25 @@ class TaskService:
                 execute_at = task['execute_at']
                 tasks_data[task_json] = execute_at
             
-            # Сохраняем в единую очередь
+            # Сохраняем в единую смешанную очередь
             if tasks_data:
                 self.redis_client.zadd("task_queue", tasks_data)
                 self.redis_client.expire("task_queue", 48 * 3600)  # TTL 48 часов
                 
-                logger.debug(f"📋 Сохранено {len(tasks)} задач в Redis")
+                logger.debug(f"📋 Сохранено {len(tasks)} задач в смешанную очередь task_queue")
             
         except Exception as e:
-            logger.error(f"Ошибка сохранения задач в Redis: {e}")
+            logger.error(f"Ошибка сохранения задач в смешанную очередь: {e}")
     
     async def get_task_stats(self) -> Dict[str, int]:
-        """Получает базовую статистику задач из общей очереди"""
+        """Получает базовую статистику задач из смешанной очереди"""
         try:
             current_time = time.time()
             
-            # Общее количество задач
+            # Общее количество задач в смешанной очереди
             total_tasks = self.redis_client.zcard("task_queue") or 0
             
-            # Готовые к выполнению
+            # Готовые к выполнению в смешанной очереди
             ready_tasks = self.redis_client.zcount("task_queue", 0, current_time) or 0
             
             # Будущие задачи
@@ -490,116 +497,45 @@ class TaskService:
             # Retry задачи
             retry_tasks = self.redis_client.llen("retry_tasks") or 0
             
+            # НОВОЕ: Анализ типов задач в готовых задачах
+            ready_tasks_data = self.redis_client.zrangebyscore(
+                "task_queue", 0, current_time, start=0, num=100
+            )
+            
+            view_ready = 0
+            subscribe_ready = 0
+            
+            for task_json in ready_tasks_data:
+                try:
+                    task_data = json.loads(task_json)
+                    task_type = task_data.get('task_type', '')
+                    if task_type == 'view':
+                        view_ready += 1
+                    elif task_type == 'subscribe':
+                        subscribe_ready += 1
+                except:
+                    continue
+            
             return {
                 'total_tasks': total_tasks,
                 'ready_tasks': ready_tasks,
                 'future_tasks': future_tasks,
                 'retry_tasks': retry_tasks,
-                'queue_name': 'task_queue'
+                'queue_name': 'task_queue (mixed batches)',
+                'view_ready': view_ready,
+                'subscribe_ready': subscribe_ready
             }
             
         except Exception as e:
-            logger.error(f"Ошибка получения статистики задач: {e}")
+            logger.error(f"Ошибка получения статистики смешанных задач: {e}")
             return {}
-    
-
-    async def get_enhanced_task_stats(self) -> Dict:
-        """Получает расширенную статистику задач включая данные воркера"""
-        try:
-            current_time = time.time()
-            
-            # Базовая статистика из Redis
-            total_tasks = self.redis_client.zcard("task_queue") or 0
-            ready_tasks = self.redis_client.zcount("task_queue", 0, current_time) or 0
-            retry_tasks = self.redis_client.llen("retry_tasks") or 0
-            
-            # Готовые задачи на ближайшие периоды
-            ready_next_minute = self.redis_client.zcount("task_queue", current_time, current_time + 60) or 0
-            ready_next_hour = self.redis_client.zcount("task_queue", current_time, current_time + 3600) or 0
-            
-            # НОВОЕ: Получаем статистику выполненных задач из воркера
-            worker_stats_raw = self.redis_client.get('worker_stats')
-            if worker_stats_raw:
-                worker_stats = json.loads(worker_stats_raw)
-                
-                # Проверяем актуальность данных
-                stats_age = current_time - worker_stats.get('timestamp', 0)
-                if stats_age <= 300:  # Данные не старше 5 минут
-                    executed_minute = worker_stats.get('tasks_last_minute', 0)
-                    executed_5min = worker_stats.get('tasks_last_5min', 0) 
-                    executed_hour = worker_stats.get('tasks_last_hour', 0)
-                    avg_per_minute = worker_stats.get('avg_tasks_per_minute', 0.0)
-                    avg_per_second = worker_stats.get('avg_tasks_per_second', 0.0)
-                    worker_success_rate = worker_stats.get('success_rate', 0.0)
-                    view_tasks = worker_stats.get('view_tasks', 0)
-                    subscribe_tasks = worker_stats.get('subscribe_tasks', 0)
-                else:
-                    # Данные устарели
-                    executed_minute = executed_5min = executed_hour = 0
-                    avg_per_minute = avg_per_second = worker_success_rate = 0.0
-                    view_tasks = subscribe_tasks = 0
-            else:
-                # Нет данных от воркера
-                executed_minute = executed_5min = executed_hour = 0
-                avg_per_minute = avg_per_second = worker_success_rate = 0.0
-                view_tasks = subscribe_tasks = 0
-            
-            # Дополнительная статистика аккаунтов
-            from database import get_extended_account_stats, get_banned_accounts_24h
-            account_stats = await get_extended_account_stats()
-            banned_24h = await get_banned_accounts_24h()
-            
-            enhanced_stats = {
-                # Основные метрики
-                'total_tasks': total_tasks,
-                'ready_tasks': ready_tasks,
-                'future_tasks': total_tasks - ready_tasks,
-                'retry_tasks': retry_tasks,
-                
-                # Готовые задачи по времени
-                'ready_tasks_minute': ready_next_minute,
-                'ready_tasks_hour': ready_next_hour,
-                
-                # ОБНОВЛЕННЫЕ выполненные задачи
-                'executed_tasks_minute': executed_minute,
-                'executed_tasks_5min': executed_5min,
-                'executed_tasks_hour': executed_hour,
-                
-                # НОВЫЕ средние показатели
-                'avg_tasks_per_minute': avg_per_minute,
-                'avg_tasks_per_second': avg_per_second,
-                
-                # Статистика по типам задач
-                'view_tasks_executed': view_tasks,
-                'subscribe_tasks_executed': subscribe_tasks,
-                
-                # Статистика аккаунтов
-                'banned_accounts_24h': banned_24h,
-                'avg_tasks_per_account_hour': account_stats.get('avg_tasks_per_account_hour', 0.0),
-                'active_accounts': account_stats.get('active', 0),
-                
-                # Эффективность
-                'success_rate': worker_success_rate,
-                
-                # Статус системы
-                'worker_online': worker_stats_raw is not None,
-                'stats_timestamp': current_time,
-                'formatted_time': time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(current_time))
-            }
-            
-            return enhanced_stats
-            
-        except Exception as e:
-            logger.error(f"Ошибка получения расширенной статистики задач: {e}")
-            return {}
-
     
     async def cleanup_expired_tasks(self, max_age_hours: float = 48.0) -> int:
-        """Очищает просроченные задачи"""
+        """Очищает просроченные задачи из смешанной очереди"""
         try:
             cutoff_time = time.time() - (max_age_hours * 3600)
             
-            # Получаем просроченные задачи
+            # Получаем просроченные задачи из смешанной очереди
             expired_tasks = self.redis_client.zrangebyscore(
                 "task_queue",
                 min=0,
@@ -615,12 +551,12 @@ class TaskService:
                     self.redis_client.zrem("task_queue", task_json)
                     cleaned_count += 1
                 
-                logger.info(f"🗑️ Очищено {cleaned_count} просроченных задач (>{max_age_hours}ч)")
+                logger.info(f"🗑️ Очищено {cleaned_count} просроченных задач из смешанной очереди (>{max_age_hours}ч)")
             
             return cleaned_count
             
         except Exception as e:
-            logger.error(f"Ошибка очистки просроченных задач: {e}")
+            logger.error(f"Ошибка очистки просроченных задач из смешанной очереди: {e}")
             return 0
 
 # Экспортируем экземпляр сервиса
